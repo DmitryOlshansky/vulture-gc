@@ -1,0 +1,9 @@
+{
+	"authors": [
+		"Dmitry Olshansky"
+	],
+	"copyright": "Copyright © 2024, Dmitry Olshansky",
+	"description": "A hopefully betterGC for dlang",
+	"license": "BSL-1.0",
+	"name": "vulture-gc"
+}
