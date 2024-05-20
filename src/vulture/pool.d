@@ -5,7 +5,7 @@ import core.bitop;
 import core.internal.spinlock;
 import core.stdc.string;
 
-import vulture.bits;
+import vulture.bits, vulture.size_class;
 
 package:
 nothrow  @nogc:
@@ -71,12 +71,6 @@ ubyte toPow2(size_t size) nothrow pure
     return cast(ubyte)(notPow2 + bsr(size));
 }
 
-ubyte sizeClassOf(size_t size) nothrow
-{
-    if (size <= 16) return 4;
-    return toPow2(size);
-}
-
 ubyte bucketOf(size_t size) nothrow
 {
     ubyte pow2 = toPow2(size);
@@ -99,9 +93,8 @@ unittest
 /// Memory is allocated in bulk - 32 objects at a time.
 struct SmallPool
 {
-    uint freeObjects; // total free objects
-    uint runs; // memory is organized into runs of 1024 objects
-    uint* freeInRun; // count of free objects in each run
+    uint freeObjects;  // total free objects
+    uint objectSize;   // size of objects in this pool
     BitArray markbits; // granularity is per object
     NibbleArray attrs; // granularity is per object
 }
@@ -146,7 +139,6 @@ struct Pool
     PoolType type;          // type of pool (immutable)
     bool isFree;            // if this pool is completely free
     bool noScan;            // if objects of this pool have no pointers (immutable)
-    ubyte shiftBy;          // granularity, expressed in shift amount (immutable)
     Impl impl;              // concrete pool details
     void[] mapped;          // real region covered by this pool, immutable
     Pool* next;             // freelist link
@@ -156,22 +148,14 @@ nothrow @nogc:
     @property ref large(){ return impl.large; }
     @property ref huge(){ return impl.huge; }
 
-    void initialize(void[] slice, bool noScan)
+    void initializeSmall(PoolType type, ubyte clazz, bool noScan)
     {
         _lock = shared(SpinLock)(SpinLock.Contention.medium);
         isFree = true;
-        noScan = noScan;
-        
-    }
-
-    void Dtor()
-    {
-        // madvise with MADV_FREE
-    }
-
-    void reset()
-    {
-        
+        this.noScan = noScan;
+        this.type = PoolType.SMALL;
+        small.objectSize = cast(uint)classToSize(clazz);
+        small.freeObjects = cast(uint)mapped.length / small.objectSize;
     }
 
     void lock(){ _lock.lock(); }
@@ -252,43 +236,43 @@ nothrow @nogc:
 
     uint getAttrSmall(void* p)
     {
-        uint offset = cast(uint)(p - mapped.ptr)>>shiftBy;
+        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
     uint setAttrSmall(void* p, uint attrs)
     {
-        uint offset = cast(uint)(p - mapped.ptr)>>shiftBy;
+        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         small.attrs[offset] |= cast(ubyte)attrToNibble(attrs);
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
     uint clrAttrSmall(void* p, uint attrs)
     {
-        uint offset = cast(uint)(p - mapped.ptr)>>shiftBy;
+        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         small.attrs[offset] &= cast(ubyte)~attrToNibble(attrs);
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
     size_t sizeOfSmall(void* p)
     {
-        return 1<<shiftBy;
+        return small.objectSize;
     }
 
     void* addrOfSmall(void* p)
     {
-        auto roundedDown = cast(size_t)p & ~((1<<shiftBy)-1);
+        auto roundedDown = cast(size_t)p - cast(size_t)p % small.objectSize;
         return cast(void*)roundedDown;
     }
 
     // uint.max means same bits
     BlkInfo tryExtendSmall(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
     {
-        size_t ourSize = (1<<shiftBy);
+        size_t ourSize = small.objectSize;
         if (minSize < ourSize)
         {
             size_t newSize = ourSize > maxSize ? maxSize : ourSize;
-            uint offset = cast(uint)(p - mapped.ptr)>>shiftBy;
+            uint offset = cast(uint)(p - mapped.ptr) / ourSize;
             if (bits != uint.max)
                 small.attrs[offset] = attrToNibble(bits);
             return BlkInfo(p, newSize, attrFromNibble(small.attrs[offset], noScan));
@@ -299,13 +283,13 @@ nothrow @nogc:
     BlkInfo querySmall(void* p)
     {
         void* base = addrOfSmall(p);
-        uint offset = cast(uint)(p - mapped.ptr)>>shiftBy;
-        return BlkInfo(base, 1<<shiftBy, attrFromNibble(small.attrs[offset], noScan));
+        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
+        return BlkInfo(base, small.objectSize, attrFromNibble(small.attrs[offset], noScan));
     }
 
     void freeSmall(void* p)
     {
-        uint offset = cast(uint)(p - mapped.ptr)>>shiftBy;
+        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         small.attrs[offset] = 0;
     }
 

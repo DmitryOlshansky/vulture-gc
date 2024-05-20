@@ -37,7 +37,7 @@ nothrow @nogc:
     }
 
     // allocate an uninitialized pool object
-    Pool* allocate(size_t size, bool noScan) {
+    Pool* allocate(size_t size) {
         auto _size = roundToChunk(size);
         auto nchunks = _size / CHUNKSIZE;        
         Pool* pool;
@@ -54,7 +54,7 @@ nothrow @nogc:
             poolMap[i] = pool;
         }
         auto arena = memory[start*CHUNKSIZE .. (start+nchunks)*CHUNKSIZE];
-        pool.initialize(arena, noScan);
+        pool.mapped = arena;
         return pool;
     }
 

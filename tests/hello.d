@@ -18,12 +18,6 @@ import vulture.gc;
 import core.gc.registry;
 
 
-extern(C) pragma(crt_constructor) void register_vulture() {
-    import core.sys.posix.unistd;
-    write(2, s.ptr, s.length);
-    registerGCFactory("vulture", &createVulture);
-}
-
 void main() {
     new int[4];
 }

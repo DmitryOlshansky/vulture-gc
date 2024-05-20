@@ -11,12 +11,26 @@ import core.sys.linux.sys.sysinfo;
 
 import vulture.pool_table;
 import vulture.pool;
+import vulture.size_class;
 import vulture.treap;
 
 alias Stats = core.memory.GC.Stats;
 
 enum {
     INITIAL_POOLMAP_SIZE = 32,    
+}
+
+__gshared extern(C) void function() registrator;
+
+extern(C) pragma(crt_constructor) void register_vulture() {
+    import core.sys.posix.unistd;
+    immutable s = "Registering vulture GC";
+    write(2, s.ptr, s.length);
+    registerGCFactory("vulture", &createVulture);
+}
+
+shared static this() {
+    registrator = &register_vulture;
 }
 
 GC createVulture() {
@@ -184,7 +198,7 @@ class VultureGC : GC
 
     BlkInfo smallAlloc(size_t size, uint bits) nothrow
     {
-        ubyte sclass = sizeClassOf(size);
+        ubyte sclass = sizeToClass(size);
         return BlkInfo.init;
     }
 
@@ -213,7 +227,7 @@ class VultureGC : GC
         // TODO: maybe GC
         // needs meta lock for numLargePools
         size_t poolSize = (++numLargePools[noScan])*16*CHUNKSIZE;
-        auto pool = memTable.allocate(poolSize, noScan);
+        auto pool = memTable.allocate(poolSize);
         metaLock.unlock();
         return pool.allocateLarge(size, bits);
     }
