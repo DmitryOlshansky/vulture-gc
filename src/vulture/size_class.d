@@ -55,3 +55,14 @@ ubyte sizeToClass(size_t size) {
 size_t classToSize(ubyte clazz) {
     return sizeClasses[clazz];
 }
+
+
+unittest
+{
+    assert(sizeToClass(0) == 0);
+    assert(sizeToClass(15) == 0);
+    assert(sizeToClass(16) == 0);
+    assert(sizeToClass(17) == 1);
+    assert(sizeToClass(2048) == 14);
+}
+

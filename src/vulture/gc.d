@@ -13,18 +13,15 @@ import vulture.pool_table;
 import vulture.pool;
 import vulture.size_class;
 import vulture.treap;
+import vulture.freelist;
 
 alias Stats = core.memory.GC.Stats;
-
-enum {
-    INITIAL_POOLMAP_SIZE = 32,    
-}
 
 __gshared extern(C) void function() registrator;
 
 extern(C) pragma(crt_constructor) void register_vulture() {
     import core.sys.posix.unistd;
-    immutable s = "Registering vulture GC";
+    immutable s = "Registering vulture GC\n";
     write(2, s.ptr, s.length);
     registerGCFactory("vulture", &createVulture);
 }
@@ -47,16 +44,18 @@ class VultureGC : GC
     Treap!Range ranges;
 
     // Lock around most of GC metadata including memTable
-    auto metaLock = shared(SpinLock)(SpinLock.Contention.brief);
+    shared SpinLock metaLock;
     MemoryTable memTable;
     size_t enabled = 1;
     bool _inFinalizer = false;
     size_t[2] numLargePools;
+    FreeList[sizeClasses.length][2] freeLists;
 
     this() {
         sysinfo_ info;
         sysinfo(&info);
         size_t memorySize = (info.totalram + info.totalswap) * PAGESIZE;
+        metaLock = shared(SpinLock)(SpinLock.Contention.brief);
         memTable = MemoryTable(memorySize);
         import core.stdc.stdio;
         printf("Vulture GC initialized\n");
@@ -199,7 +198,32 @@ class VultureGC : GC
     BlkInfo smallAlloc(size_t size, uint bits) nothrow
     {
         ubyte sclass = sizeToClass(size);
-        return BlkInfo.init;
+        bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
+        auto freelist = &freeLists[noScan][sclass];
+        auto fromFreeList = freelist.pop();
+        if (!fromFreeList) {
+            size_t objectSize = classToSize(sclass);
+            metaLock.lock();
+            foreach (size_t i; 0 .. memTable.length) {
+                auto pool = memTable[i];
+                if (pool.type == PoolType.SMALL && pool.small.objectSize == objectSize) {
+                    metaLock.unlock();
+                    pool.lock();
+                    scope(exit) pool.unlock();
+                    
+                    auto batch = pool.allocateSmall();
+                    if (batch.head != null) {
+                        if (batch.head != batch.tail)
+                            freelist.push(batch.head.next, batch.tail);
+                        fromFreeList = batch.head;
+                        break;
+                    }
+                }
+                metaLock.lock();
+            }
+        }
+        *cast(ubyte*)(fromFreeList + size_t.sizeof) = attrToNibble(bits);
+        return BlkInfo(cast(void*)fromFreeList, size, bits); 
     }
 
     BlkInfo largeAlloc(size_t size, uint bits) nothrow

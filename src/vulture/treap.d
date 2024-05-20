@@ -115,13 +115,6 @@ nothrow:
         root = null;
     }
 
-    version(unittest)
-    bool valid()
-    {
-        return valid(root);
-    }
-
-
     version(none)
     uint height()
     {

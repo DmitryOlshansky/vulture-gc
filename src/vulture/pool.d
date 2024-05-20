@@ -9,13 +9,13 @@ import vulture.bits, vulture.size_class;
 
 package:
 nothrow  @nogc:
-enum
-{
+
+enum {
     PAGESIZE = 4096,
     CHUNKSIZE = 512 * PAGESIZE,
     MAXSMALL = 2048,
     MAXLARGE = 8 * CHUNKSIZE, 
-    SMALL_RUN_SIZE = 1024 // must be power of 2
+    SMALL_BATCH_SIZE = 32
 }
 
 alias BlkInfo = core.memory.GC.BlkInfo;
@@ -28,12 +28,6 @@ enum PoolType {
     HUGE = 3   // 8M+
 }
 
-enum { // measured as powers of 2
-    FIRST_SIZE_CLASS = 4,
-    LAST_SIZE_CLASS = 11,
-    SIZE_CLASSES = LAST_SIZE_CLASS - FIRST_SIZE_CLASS
-}
-
 // Buckets for Large pool
 enum BUCKETS = (toPow2(MAXLARGE) - 12 + 3) / 4;
 
@@ -44,8 +38,7 @@ enum NibbleAttr : ubyte {
     STRUCTFINAL = 0x8
 }
 
-uint attrFromNibble(ubyte nibble, bool noScan) nothrow pure
-{
+uint attrFromNibble(ubyte nibble, bool noScan) nothrow pure {
     uint attr;
     if (nibble & NibbleAttr.FINALIZE) attr |= BlkAttr.FINALIZE;
     if (nibble & NibbleAttr.APPENDABLE) attr |= BlkAttr.APPENDABLE;
@@ -55,8 +48,7 @@ uint attrFromNibble(ubyte nibble, bool noScan) nothrow pure
     return attr;
 }
 
-ubyte attrToNibble(uint attr) nothrow pure
-{
+ubyte attrToNibble(uint attr) nothrow pure {
     ubyte nibble;
     if (attr & BlkAttr.FINALIZE) nibble |= NibbleAttr.FINALIZE;
     if (attr & BlkAttr.APPENDABLE) nibble |= NibbleAttr.APPENDABLE;
@@ -65,38 +57,37 @@ ubyte attrToNibble(uint attr) nothrow pure
     return nibble;
 }
 
-ubyte toPow2(size_t size) nothrow pure
-{
+ubyte toPow2(size_t size) nothrow pure {
     ubyte notPow2 = (size & (size-1)) != 0;
     return cast(ubyte)(notPow2 + bsr(size));
 }
 
-ubyte bucketOf(size_t size) nothrow
-{
+ubyte bucketOf(size_t size) nothrow {
     ubyte pow2 = toPow2(size);
     assert(pow2 >= 12); // 4K+ in large pool
     ubyte bucket = cast(ubyte)((pow2 - 12) / 4);
     return bucket > BUCKETS-1 ? BUCKETS-1 : bucket;
 }
 
-unittest
-{
-    assert(sizeClassOf(0) == 4);
-    assert(sizeClassOf(15) == 4);
-    assert(sizeClassOf(16) == 4);
-    assert(sizeClassOf(17) == 5);
-    assert(sizeClassOf(2048) == 11);
-}
-
-
 /// Segregated pool with a single size class.
 /// Memory is allocated in bulk - 32 objects at a time.
 struct SmallPool
 {
-    uint freeObjects;  // total free objects
+    uint objects;      // total objects
     uint objectSize;   // size of objects in this pool
+    uint nextFree;     // index of next free object batch
     BitArray markbits; // granularity is per object
-    NibbleArray attrs; // granularity is per object
+    ubyte* attrs;      // granularity is per object
+}
+
+struct SmallAlloc {
+    void* next;
+    ubyte* attrsPtr;
+}
+
+struct SmallAllocBatch {
+    SmallAlloc* head;
+    SmallAlloc* tail;
 }
 
 /// A set of pages organized into a bunch of free lists
@@ -113,14 +104,15 @@ struct LargePool
     // size of an object or a run of free pages, in 4k pages
     uint* sizeTable; // one uint per page
     BitArray markbits;
-    NibbleArray attrs;
+    ubyte* attrs;
 }
 
 /// A "pool" that represents single huge allocation.
 /// All requests to realloc or extend are forwarded to
-/// respective OS primitives. Granularity is 1MB.
+/// respective OS primitives. Granularity is one chunk - 2MB.
 struct HugePool
 {
+    size_t size;
     bool mark;
     bool finals;
     bool structFinals;
@@ -155,7 +147,9 @@ nothrow @nogc:
         this.noScan = noScan;
         this.type = PoolType.SMALL;
         small.objectSize = cast(uint)classToSize(clazz);
-        small.freeObjects = cast(uint)mapped.length / small.objectSize;
+        small.objects = cast(uint)mapped.length / small.objectSize;
+        small.nextFree = 0;
+        //TODO: allocate bits and nibbles
     }
 
     void lock(){ _lock.lock(); }
@@ -223,54 +217,64 @@ nothrow @nogc:
         else return freeLarge(p);
     }
 
-    void runFinalizers(const void[] segment)
-    {
+    void runFinalizers(const void[] segment) {
         // TODO
     }
 
 // SMALL POOL implementations
-    void* allocateSmall() return
-    {
-        return null;
+    // small allocates in batches
+    SmallAllocBatch allocateSmall() {
+        auto remaining = small.objects - small.nextFree;
+        size_t batchSize = remaining > SMALL_BATCH_SIZE ? SMALL_BATCH_SIZE : remaining;
+        if (batchSize == 0) return SmallAllocBatch(null, null);
+        size_t size = small.objectSize;
+        void* start = cast(SmallAlloc*)(mapped.ptr + small.nextFree * size);
+        void* end = start + batchSize * size;
+        ubyte* attrsPtr = small.attrs + small.nextFree;
+        for(void* p = start; p < end; p += size) {
+            auto sp = cast(SmallAlloc*)p;
+            if (p != end - size) {
+                sp.next = p + size;
+            }
+            else {
+                sp.next = null;
+            }
+            sp.attrsPtr = attrsPtr++;
+        }
+        small.nextFree += batchSize;
+        return SmallAllocBatch(cast(SmallAlloc*)start, cast(SmallAlloc*)(end - size));
     }
 
-    uint getAttrSmall(void* p)
-    {
+    uint getAttrSmall(void* p) {
         uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
-    uint setAttrSmall(void* p, uint attrs)
-    {
+    uint setAttrSmall(void* p, uint attrs) {
         uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         small.attrs[offset] |= cast(ubyte)attrToNibble(attrs);
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
-    uint clrAttrSmall(void* p, uint attrs)
-    {
+    uint clrAttrSmall(void* p, uint attrs) {
         uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         small.attrs[offset] &= cast(ubyte)~attrToNibble(attrs);
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
-    size_t sizeOfSmall(void* p)
-    {
+    size_t sizeOfSmall(void* p) {
         return small.objectSize;
     }
 
-    void* addrOfSmall(void* p)
-    {
+    void* addrOfSmall(void* p) {
         auto roundedDown = cast(size_t)p - cast(size_t)p % small.objectSize;
         return cast(void*)roundedDown;
     }
 
     // uint.max means same bits
-    BlkInfo tryExtendSmall(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
-    {
+    BlkInfo tryExtendSmall(void* p, size_t minSize, size_t maxSize, uint bits=uint.max) {
         size_t ourSize = small.objectSize;
-        if (minSize < ourSize)
-        {
+        if (minSize < ourSize) {
             size_t newSize = ourSize > maxSize ? maxSize : ourSize;
             uint offset = cast(uint)(p - mapped.ptr) / ourSize;
             if (bits != uint.max)
@@ -280,15 +284,13 @@ nothrow @nogc:
         return BlkInfo.init;
     }
 
-    BlkInfo querySmall(void* p)
-    {
+    BlkInfo querySmall(void* p) {
         void* base = addrOfSmall(p);
         uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         return BlkInfo(base, small.objectSize, attrFromNibble(small.attrs[offset], noScan));
     }
 
-    void freeSmall(void* p)
-    {
+    void freeSmall(void* p) {
         uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         small.attrs[offset] = 0;
     }
@@ -448,7 +450,7 @@ nothrow @nogc:
 
     size_t sizeOfHuge(void* p)
     {
-        return mapped.length;
+        return huge.size;
     }
 
     void* addrOfHuge(void* p)
@@ -465,28 +467,14 @@ nothrow @nogc:
 
     BlkInfo queryHuge(void* p)
     {
-        size_t size = mapped.length; // TODO: find the real size not rounded to CHUNKSIZE
+        size_t size = huge.size;
         uint attrs = getAttrHuge(p);
         return BlkInfo(mapped.ptr, size, attrs);
     }
 }
 
 /*
-Pool* newSmallPool(ubyte sizeClass, bool noScan) nothrow
-{
-    Pool* p = cast(Pool*)common.xmalloc(Pool.sizeof);
-    p.type = PoolType.SMALL;
-    p.noScan = noScan;
-    p.shiftBy = sizeClass;
-    p.initialize((sizeClass-FIRST_SIZE_CLASS+1) * CHUNKSIZE);
-    uint objects = cast(uint)(p.maxAddr - p.minAddr)>>sizeClass;
-    p.small.freeObjects = objects;
-    p.small.runs  = objects / SMALL_RUN_SIZE;
-    p.small.freeInRun = cast(uint*)common.xmalloc(uint.sizeof*p.small.runs);
-    p.small.freeInRun[0..p.small.runs] = SMALL_RUN_SIZE;
-    //TODO: allocate bits and nibbles
-    return p;
-}
+
 
 Pool* newLargePool(size_t size, bool noScan) nothrow
 {
