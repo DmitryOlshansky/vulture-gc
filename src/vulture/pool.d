@@ -4,14 +4,14 @@ static import core.memory;
 import core.bitop;
 import core.internal.spinlock;
 import core.stdc.string;
+debug(vulture) import core.stdc.stdio;
 
-import vulture.bits, vulture.size_class;
+import vulture.bits, vulture.size_class, vulture.memory;
 
 package:
 nothrow  @nogc:
 
 enum {
-    PAGESIZE = 4096,
     CHUNKSIZE = 512 * PAGESIZE,
     MAXSMALL = 2048,
     MAXLARGE = 8 * CHUNKSIZE, 
@@ -140,7 +140,7 @@ nothrow @nogc:
     @property ref large(){ return impl.large; }
     @property ref huge(){ return impl.huge; }
 
-    void initializeSmall(PoolType type, ubyte clazz, bool noScan)
+    void initializeSmall(ubyte clazz, bool noScan)
     {
         _lock = shared(SpinLock)(SpinLock.Contention.medium);
         isFree = true;
@@ -149,7 +149,25 @@ nothrow @nogc:
         small.objectSize = cast(uint)classToSize(clazz);
         small.objects = cast(uint)mapped.length / small.objectSize;
         small.nextFree = 0;
-        //TODO: allocate bits and nibbles
+        small.attrs = cast(ubyte*)mapMemory(small.objectSize).ptr;
+        //TODO: allocate bits
+    }
+
+    void initializeLarge(bool noScan) {
+        type = PoolType.LARGE;
+        this.noScan = noScan;
+        large.largestFreeEstimate = cast(uint)(mapped.length);
+        large.pages = cast(uint)(mapped.length / PAGESIZE);
+        large.buckets[] = uint.max;
+        large.offsetTable = cast(uint*)mapMemory(uint.sizeof *large.pages).ptr;
+        large.sizeTable = cast(uint*)mapMemory(uint.sizeof * large.pages).ptr;
+        //TODO: allocate bits
+        large.attrs = cast(ubyte*)mapMemory(large.pages).ptr;
+        // setup free lists as one big chunk of highest bucket
+        large.sizeTable[0] = (large.largestFreeEstimate + PAGESIZE-1) / PAGESIZE;
+        large.offsetTable[0] = uint.max;
+        large.buckets[BUCKETS-1] = 0;
+
     }
 
     void lock(){ _lock.lock(); }
@@ -230,6 +248,7 @@ nothrow @nogc:
         size_t size = small.objectSize;
         void* start = cast(SmallAlloc*)(mapped.ptr + small.nextFree * size);
         void* end = start + batchSize * size;
+        debug(vulture) printf("smallAlloc %p %p\n", mapped.ptr, mapped.ptr + mapped.length);
         ubyte* attrsPtr = small.attrs + small.nextFree;
         for(void* p = start; p < end; p += size) {
             auto sp = cast(SmallAlloc*)p;
@@ -242,6 +261,7 @@ nothrow @nogc:
             sp.attrsPtr = attrsPtr++;
         }
         small.nextFree += batchSize;
+        debug(vulture) printf("smallAlloc %p %p\n", start, end);
         return SmallAllocBatch(cast(SmallAlloc*)start, cast(SmallAlloc*)(end - size));
     }
 
@@ -326,6 +346,7 @@ nothrow @nogc:
             blk.size = psize * PAGESIZE;
             blk.attr = bits;
             // TODO: set attr metadata
+            debug(vulture) printf("large.attrs = %p\n", large.attrs);
             large.attrs[start] = attrToNibble(bits);
             return blk;
         }
@@ -346,6 +367,7 @@ nothrow @nogc:
             prev = cur;
             cur = large.offsetTable[cur];
         }
+        debug(vulture) printf("Looking for larger buckets\n");
         bucket++;
         // search larger buckets
         while (bucket < BUCKETS)
@@ -474,28 +496,6 @@ nothrow @nogc:
 }
 
 /*
-
-
-Pool* newLargePool(size_t size, bool noScan) nothrow
-{
-    Pool* p = cast(Pool*)malloc(Pool.sizeof);
-    p.type = PoolType.LARGE;
-    p.noScan = noScan;
-    p.shiftBy = 12;
-    p.initialize(size);
-    p.large.largestFreeEstimate = cast(uint)(p.maxAddr - p.minAddr);
-    p.large.pages = cast(uint)(p.maxAddr - p.minAddr) / PAGESIZE;
-    p.large.buckets[] = uint.max;
-    p.large.offsetTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
-    p.large.sizeTable = cast(uint*)common.xmalloc(uint.sizeof * p.large.pages);
-    //TODO: allocate bits and nibbles
-
-    // setup free lists as one big chunk of highest bucket
-    p.large.sizeTable[0] = (p.large.largestFreeEstimate + PAGESIZE-1) / PAGESIZE;
-    p.large.offsetTable[0] = uint.max;
-    p.large.buckets[BUCKETS-1] = 0;
-    return p;
-}
 
 Pool* newHugePool(size_t size, uint bits) nothrow
 {

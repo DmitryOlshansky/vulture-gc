@@ -2,6 +2,7 @@ module vulture.gc;
 
 import core.internal.spinlock;
 import core.stdc.string;
+debug(vulture) import core.stdc.stdio;
 static import core.memory;
 import core.gc.gcinterface;
 import core.gc.registry;
@@ -9,6 +10,7 @@ import core.lifetime;
 import core.stdc.stdlib;
 import core.sys.linux.sys.sysinfo;
 
+import vulture.memory;
 import vulture.pool_table;
 import vulture.pool;
 import vulture.size_class;
@@ -54,7 +56,8 @@ class VultureGC : GC
     this() {
         sysinfo_ info;
         sysinfo(&info);
-        size_t memorySize = (info.totalram + info.totalswap) * PAGESIZE;
+        size_t memorySize = (info.totalram + info.totalswap) * info.mem_unit;
+        debug(vulture) printf("memorySize = 0x%lx\n", memorySize);
         metaLock = shared(SpinLock)(SpinLock.Contention.brief);
         memTable = MemoryTable(memorySize);
         import core.stdc.stdio;
@@ -197,37 +200,53 @@ class VultureGC : GC
 
     BlkInfo smallAlloc(size_t size, uint bits) nothrow
     {
+        debug(vulture) printf("Allocating small %ld (%x)\n", size, bits);
         ubyte sclass = sizeToClass(size);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
         auto freelist = &freeLists[noScan][sclass];
         auto fromFreeList = freelist.pop();
+        SmallAlloc* allocateRun(Pool* pool) {
+            debug (vulture) printf("Allocating small batch\n");
+            auto batch = pool.allocateSmall();
+            debug (vulture) printf("Allocated small batch %p %p\n", batch.head, batch.tail);
+            if (batch.head != null) {
+                if (batch.head != batch.tail)
+                    freelist.push(batch.head.next, batch.tail);
+                return batch.head;
+            }
+            return null;
+        }
         if (!fromFreeList) {
             size_t objectSize = classToSize(sclass);
             metaLock.lock();
+            // todo: circular doubly-linked list of small pools by size class
             foreach (size_t i; 0 .. memTable.length) {
                 auto pool = memTable[i];
                 if (pool.type == PoolType.SMALL && pool.small.objectSize == objectSize) {
                     metaLock.unlock();
                     pool.lock();
                     scope(exit) pool.unlock();
-                    
-                    auto batch = pool.allocateSmall();
-                    if (batch.head != null) {
-                        if (batch.head != batch.tail)
-                            freelist.push(batch.head.next, batch.tail);
-                        fromFreeList = batch.head;
-                        break;
-                    }
+                    scope(exit) metaLock.lock();
+                    fromFreeList = allocateRun(pool);
+                    if (fromFreeList) break;
                 }
-                metaLock.lock();
             }
+            auto pool = memTable.allocate(CHUNKSIZE);
+            pool.lock();
+            metaLock.unlock();
+            debug(vulture) printf("Initializing small pool\n");
+            pool.initializeSmall(sclass, noScan);
+            fromFreeList = allocateRun(pool);
+            pool.unlock();
+            
         }
-        *cast(ubyte*)(fromFreeList + size_t.sizeof) = attrToNibble(bits);
-        return BlkInfo(cast(void*)fromFreeList, size, bits); 
+        *(cast(SmallAlloc*)fromFreeList).attrsPtr = attrToNibble(bits);
+        return BlkInfo(fromFreeList, size, bits); 
     }
 
     BlkInfo largeAlloc(size_t size, uint bits) nothrow
     {
+        debug(vulture) printf("Allocating large %ld (%x)\n", size, bits);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
         metaLock.lock();
         foreach(i; 0..memTable.length)
@@ -237,11 +256,11 @@ class VultureGC : GC
             if (p.type == PoolType.LARGE && p.noScan == noScan)
             {
                 p.lock();
+                scope(exit) p.unlock();
                 if (p.large.largestFreeEstimate >= size)
                 {
                     metaLock.unlock();
                     auto blk = p.allocateLarge(size, bits);
-                    p.unlock();
                     if (blk.base) return blk;
                     // estimate was wrong, continue
                     metaLock.lock();
@@ -249,10 +268,14 @@ class VultureGC : GC
             }
         }
         // TODO: maybe GC
-        // needs meta lock for numLargePools
-        size_t poolSize = (++numLargePools[noScan])*16*CHUNKSIZE;
+        // needs meta lock for numLargePools and allocate
+        auto nextSize = (++numLargePools[noScan])*16*CHUNKSIZE;
+        size_t poolSize = size < nextSize ? nextSize : roundToChunk(size * 3 / 2);
         auto pool = memTable.allocate(poolSize);
+        pool.lock();
         metaLock.unlock();
+        pool.initializeLarge(noScan);
+        scope(exit) pool.unlock();
         return pool.allocateLarge(size, bits);
     }
 

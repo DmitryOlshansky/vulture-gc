@@ -5,21 +5,13 @@
 */
 module vulture.pool_table;
 
-import vulture.pool;
+import vulture.pool, vulture.memory;
 
-import core.sys.linux.sys.mman;
+
 import core.stdc.stdlib;
+debug(vulture) import core.stdc.stdio;
 
 nothrow @nogc:
-
-void[] mapMemory(size_t size) {
-    auto roundedSize = (size + PAGESIZE - 1) & ~(PAGESIZE - 1);
-    return mmap(null, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0)[0..roundedSize];
-}
-
-void unmapMemory(void[] slice) {
-    munmap(slice.ptr, slice.length);
-}
 
 size_t roundToChunk(size_t size) {
     return (size + CHUNKSIZE - 1) & ~(CHUNKSIZE - 1);
@@ -57,7 +49,9 @@ nothrow @nogc:
         foreach (i; start .. start + nchunks) {
             poolMap[i] = pool;
         }
+        debug(vulture) printf("Memory range %ld\n", start);
         auto arena = memory[start*CHUNKSIZE .. (start+nchunks)*CHUNKSIZE];
+        debug(vulture) printf("Pool allocated %p..%p\n", arena.ptr, arena.ptr + arena.length);
         pool.mapped = arena;
         return pool;
     }

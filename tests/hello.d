@@ -7,6 +7,7 @@
 	"dependencies": {
 		"vulture-gc": { "path": ".." }
 	},
+	"debugVersions": ["vulture"],
 	"description": "A test for vulture GC registration",
 	"license": "BOOST",
 	"name": "hello"
@@ -20,4 +21,5 @@ import core.gc.registry;
 
 void main() {
     new int[4];
+	new ubyte[2048];
 }
