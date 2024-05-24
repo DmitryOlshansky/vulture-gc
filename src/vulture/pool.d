@@ -6,7 +6,7 @@ import core.internal.spinlock;
 import core.stdc.string;
 debug(vulture) import core.stdc.stdio;
 
-import vulture.bits, vulture.size_class, vulture.memory;
+import vulture.size_class, vulture.memory, vulture.fastdiv;
 
 package:
 nothrow  @nogc:
@@ -76,7 +76,8 @@ struct SmallPool
     uint objects;      // total objects
     uint objectSize;   // size of objects in this pool
     uint nextFree;     // index of next free object batch
-    BitArray markbits; // granularity is per object
+    size_t multiplier; // fast div multiplier
+    ubyte* markBits;   // granularity is per object
     ubyte* attrs;      // granularity is per object
 }
 
@@ -95,16 +96,16 @@ struct SmallAllocBatch {
 struct LargePool
 {
     uint largestFreeEstimate; // strictly >= largest free block, in bytes
-    uint pages; // number of pages in this pool
-    uint[BUCKETS] buckets; // index of the first free run
+    uint pages;               // number of pages in this pool
+    uint[BUCKETS] buckets;    // index of the first free run
     // offset serves double duty
     // when pages are free it contains next in a free list
     // else it is filled with offset of start of the object
-    uint* offsetTable; // one uint per page
+    uint* offsetTable;        // one uint per page
     // size of an object or a run of free pages, in 4k pages
-    uint* sizeTable; // one uint per page
-    BitArray markbits;
-    ubyte* attrs;
+    uint* sizeTable;          // one uint per page
+    ubyte* markBits;          // bits used while marking, one bit per page
+    ubyte* attrs;             // attributes one byte per page
 }
 
 /// A "pool" that represents single huge allocation.
@@ -129,7 +130,6 @@ struct Pool
     }
     shared SpinLock _lock;  // per pool lock
     PoolType type;          // type of pool (immutable)
-    bool isFree;            // if this pool is completely free
     bool noScan;            // if objects of this pool have no pointers (immutable)
     Impl impl;              // concrete pool details
     void[] mapped;          // real region covered by this pool, immutable
@@ -143,14 +143,14 @@ nothrow @nogc:
     void initializeSmall(ubyte clazz, bool noScan)
     {
         _lock = shared(SpinLock)(SpinLock.Contention.medium);
-        isFree = true;
         this.noScan = noScan;
         this.type = PoolType.SMALL;
         small.objectSize = cast(uint)classToSize(clazz);
         small.objects = cast(uint)mapped.length / small.objectSize;
+        small.multiplier = multiplier(small.objectSize);
         small.nextFree = 0;
         small.attrs = cast(ubyte*)mapMemory(small.objectSize).ptr;
-        //TODO: allocate bits
+        small.markBits = cast(ubyte*)mapMemory(small.objectSize / 8).ptr;
     }
 
     void initializeLarge(bool noScan) {
@@ -161,13 +161,22 @@ nothrow @nogc:
         large.buckets[] = uint.max;
         large.offsetTable = cast(uint*)mapMemory(uint.sizeof *large.pages).ptr;
         large.sizeTable = cast(uint*)mapMemory(uint.sizeof * large.pages).ptr;
-        //TODO: allocate bits
         large.attrs = cast(ubyte*)mapMemory(large.pages).ptr;
+        large.markBits = cast(ubyte*)mapMemory(large.pages).ptr;
         // setup free lists as one big chunk of highest bucket
         large.sizeTable[0] = (large.largestFreeEstimate + PAGESIZE-1) / PAGESIZE;
         large.offsetTable[0] = uint.max;
         large.buckets[BUCKETS-1] = 0;
+    }
 
+    void initializeHuge(size_t size, uint bits) {
+        type = PoolType.HUGE;
+        this.noScan = (bits & BlkAttr.NO_SCAN) != 0;
+        huge.mark = 0;
+        huge.size = size;
+        huge.finals = ((bits & BlkAttr.FINALIZE) != 0);
+        huge.structFinals = ((bits & BlkAttr.STRUCTFINAL) != 0);
+        huge.appendable = ((bits & BlkAttr.APPENDABLE) != 0);
     }
 
     void lock(){ _lock.lock(); }
@@ -228,13 +237,6 @@ nothrow @nogc:
         else return queryHuge(p);
     }
 
-    void free(void* p)
-    {
-        assert(type != PoolType.HUGE); // Huge is handled separately
-        if (type == PoolType.SMALL) return freeSmall(p);
-        else return freeLarge(p);
-    }
-
     void runFinalizers(const void[] segment) {
         // TODO
     }
@@ -266,18 +268,18 @@ nothrow @nogc:
     }
 
     uint getAttrSmall(void* p) {
-        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
+        uint offset = indexOfSmall(p);
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
     uint setAttrSmall(void* p, uint attrs) {
-        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
+        uint offset = indexOfSmall(p);
         small.attrs[offset] |= cast(ubyte)attrToNibble(attrs);
         return attrFromNibble(small.attrs[offset], noScan);
     }
 
     uint clrAttrSmall(void* p, uint attrs) {
-        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
+        uint offset = indexOfSmall(p);
         small.attrs[offset] &= cast(ubyte)~attrToNibble(attrs);
         return attrFromNibble(small.attrs[offset], noScan);
     }
@@ -287,8 +289,12 @@ nothrow @nogc:
     }
 
     void* addrOfSmall(void* p) {
-        auto roundedDown = cast(size_t)p - cast(size_t)p % small.objectSize;
+        auto roundedDown = cast(size_t)p - indexOfSmall(p) * small.objectSize;
         return cast(void*)roundedDown;
+    }
+
+    uint indexOfSmall(void* p) {
+        return cast(uint)divide(p - mapped.ptr, small.objectSize);
     }
 
     // uint.max means same bits
@@ -308,11 +314,6 @@ nothrow @nogc:
         void* base = addrOfSmall(p);
         uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         return BlkInfo(base, small.objectSize, attrFromNibble(small.attrs[offset], noScan));
-    }
-
-    void freeSmall(void* p) {
-        uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
-        small.attrs[offset] = 0;
     }
 
 // LARGE POOL implementations
@@ -494,62 +495,3 @@ nothrow @nogc:
         return BlkInfo(mapped.ptr, size, attrs);
     }
 }
-
-/*
-
-Pool* newHugePool(size_t size, uint bits) nothrow
-{
-    Pool* p = cast(Pool*)common.xmalloc(Pool.sizeof);
-    p.type = PoolType.HUGE;
-    p.shiftBy = 20;
-    p.noScan = ((bits & BlkAttr.NO_SCAN) != 0);
-    p.initialize(size);
-    p.isFree = false;
-    p.huge.finals = ((bits & BlkAttr.FINALIZE) != 0);
-    p.huge.structFinals = ((bits & BlkAttr.STRUCTFINAL) != 0);
-    p.huge.appendable = ((bits & BlkAttr.APPENDABLE) != 0);
-    return p;
-}
-
-unittest
-{
-    Pool* pool = newSmallPool(5, true);
-
-}
-
-
-unittest
-{
-    enum size = 12*CHUNKSIZE;
-    Pool* pool = newLargePool(size, true);
-    foreach_reverse(item; 1..1000)
-    {
-        size_t itemSize = item*PAGESIZE;
-        struct Link
-        {
-            Link* next;
-        }
-        Link* head = null;
-        size_t cnt = 0;
-        for(;;cnt++)
-        {
-            BlkInfo blk = pool.allocateLarge(itemSize, 0);
-            if (!blk.base) break;
-            Link* n = cast(Link*)blk.base;
-            assert(blk.base);
-            assert(blk.size == itemSize);
-            n.next = head;
-            head = n;
-        }
-        assert(cnt >= size/1000/PAGESIZE);
-        if (item == 1)
-            assert(cnt == size/PAGESIZE);
-        while(head)
-        {
-            Link* cur = head;
-            head = head.next;
-            pool.freeLarge(cur);
-        }
-    }
-}
-*/

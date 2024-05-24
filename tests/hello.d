@@ -22,4 +22,5 @@ import core.gc.registry;
 void main() {
     new int[4];
 	new ubyte[2048];
+	new ubyte[32<<20];
 }

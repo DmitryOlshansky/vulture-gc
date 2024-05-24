@@ -281,8 +281,11 @@ class VultureGC : GC
 
     BlkInfo hugeAlloc(size_t size, uint bits) nothrow
     {
-        // TODO: implement
-        return BlkInfo.init;
+        metaLock.lock();
+        scope(exit) metaLock.unlock();
+        Pool* p = memTable.allocate(size);
+        p.initializeHuge(size, bits);
+        return BlkInfo(p.mapped.ptr, size, bits);
     }
     /*
      *
@@ -334,7 +337,7 @@ class VultureGC : GC
      */
     size_t reserve(size_t size) nothrow
     {
-        return size; // TODO: mmap + populate memory to be used in pools
+        return size;
     }
 
     /**
@@ -342,22 +345,28 @@ class VultureGC : GC
      */
     void free(void* p) nothrow
     {
-        metaLock.lock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return;
         if (pool.type == PoolType.HUGE)
         {
+            metaLock.lock();
             pool.lock();
             memTable.deallocate(pool);
             pool.unlock();
+            metaLock.unlock();
             // TODO: just remove one pool
             memTable.minimize();
             return;
         }
-        metaLock.unlock();
+        else if (pool.type == PoolType.SMALL) {
+            SmallAlloc* alloc = cast(SmallAlloc*)p;
+            alloc.attrsPtr = pool.small.attrs + (p - pool.mapped.ptr) / pool.small.objectSize;
+            auto clazz = sizeToClass(pool.small.objectSize);
+            freeLists[pool.noScan][clazz].push(alloc);
+        }
         pool.lock();
         scope(exit) pool.unlock();
-        return pool.free(p);
+        return pool.freeLarge(p);
     }
 
     /**
