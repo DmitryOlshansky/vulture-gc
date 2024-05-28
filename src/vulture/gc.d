@@ -107,6 +107,129 @@ class VultureGC : GC
         //TODO: collection ;)
     }
 
+    static struct ToScanStack
+    {
+    nothrow:
+        @disable this(this);
+
+        void reset()
+        {
+            _length = 0;
+            unmapMemory(_p[0 .._cap * Range.sizeof]);
+            _p = null;
+            _cap = 0;
+        }
+
+        void push(Range rng)
+        {
+            if (_length == _cap) grow();
+            _p[_length++] = rng;
+        }
+
+        Range pop()
+        in { assert(!empty); }
+        body
+        {
+            return _p[--_length];
+        }
+
+        ref inout(Range) opIndex(size_t idx) inout
+        in { assert(idx < _length); }
+        body
+        {
+            return _p[idx];
+        }
+
+        @property size_t length() const { return _length; }
+        @property bool empty() const { return !length; }
+
+    private:
+        void grow()
+        {
+            enum initSize = 64 * 1024; // Windows VirtualAlloc granularity
+            immutable ncap = _cap ? 2 * _cap : initSize / Range.sizeof;
+            auto p = cast(Range*)mapMemory(ncap * Range.sizeof);
+            p[0 .. _length] = _p[0 .. _length];
+            unmapMemory(_p[0.._cap * Range.sizeof]);
+            _p = p;
+            _cap = ncap;
+        }
+
+        size_t _length;
+        Range* _p;
+        size_t _cap;
+    }
+
+    ToScanStack toscan;
+
+    void mark(void *pbot, void *ptop) scope nothrow
+    {
+        void **p1 = cast(void **)pbot;
+        void **p2 = cast(void **)ptop;
+
+        // limit the amount of ranges added to the toscan stack
+        enum FANOUT_LIMIT = 32;
+        size_t stackPos;
+        Range[FANOUT_LIMIT] stack = void;
+
+    Lagain:
+        // let dmd allocate registers for memory range
+        const minAddr = memTable.memory.ptr;
+        const maxAddr = memTable.memory.ptr + memTable.memory.length;
+
+        //printf("marking range: [%p..%p] (%#zx)\n", p1, p2, cast(size_t)p2 - cast(size_t)p1);
+    Lnext: for (; p1 < p2; p1++)
+        {
+            auto p = *p1;
+
+            //if (log) debug(PRINTF) printf("\tmark %p\n", p);
+            if (p >= minAddr && p < maxAddr)
+            {
+                Pool* pool = memTable.lookup(p);
+                if (pool.type != PoolType.NONE) {
+                    auto range = pool.mark(p);
+                    if(range.ptr != null) {
+                        stack[stackPos++] = Range(range.ptr, range.ptr + range.length);
+                        if (stackPos == stack.length)
+                            break;
+                    }
+                }
+            }
+        }
+
+        Range next=void;
+        if (p1 < p2)
+        {
+            // local stack is full, push it to the global stack
+            assert(stackPos == stack.length);
+            toscan.push(Range(p1, p2));
+            // reverse order for depth-first-order traversal
+            foreach_reverse (ref rng; stack[0 .. $ - 1])
+                toscan.push(rng);
+            stackPos = 0;
+            next = stack[$-1];
+        }
+        else if (stackPos)
+        {
+            // pop range from local stack and recurse
+            next = stack[--stackPos];
+        }
+        else if (!toscan.empty)
+        {
+            // pop range from global stack and recurse
+            next = toscan.pop();
+        }
+        else
+        {
+            // nothing more to do
+            return;
+        }
+        p1 = cast(void**)next.pbot;
+        p2 = cast(void**)next.ptop;
+        // printf("  pop [%p..%p] (%#zx)\n", p1, p2, cast(size_t)p2 - cast(size_t)p1);
+        goto Lagain;
+    }
+
     /**
      * minimize free space usage
      */
@@ -182,20 +305,6 @@ class VultureGC : GC
     void* calloc(size_t size, uint bits, const TypeInfo ti) nothrow
     {
         return qalloc(size, bits, ti).base;
-    }
-
-    BlkInfo qallocWithLock(size_t size, uint bits, const TypeInfo ti) nothrow
-    {
-        // Check TypeInfo "should scan" bit
-        if (ti && !(ti.flags() & 1)) bits |= BlkAttr.NO_SCAN;
-        if (size <= MAXSMALL)
-        {
-            // Small alloc goes to TLS cache first so no locking upfront
-            metaLock.unlock();
-            return smallAlloc(size, bits);
-        }
-        if(size <= 8 * CHUNKSIZE) return largeAlloc(size, bits);
-        else return hugeAlloc(size, bits);
     }
 
     BlkInfo smallAlloc(size_t size, uint bits) nothrow
@@ -292,20 +401,17 @@ class VultureGC : GC
      */
     void* realloc(void* p, size_t size, uint bits, const TypeInfo ti) nothrow
     {
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
+        debug(vulture) printf("GC realloc %ld\n", size);
         Pool* pool = memTable.lookup(p);
-        if (!pool) return qallocWithLock(size, bits, ti).base;
+        if (!pool) return qalloc(size, bits, ti).base;
         size_t oldSize;
         {
             pool.lock();
-            metaLock.unlock();
             scope(exit) pool.unlock();
             oldSize = pool.sizeOf(p);
             BlkInfo newP = pool.tryExtend(p, size, size, bits);
             if (newP.base) return newP.base;
         }
-        // metaLock is unlocked here
         BlkInfo blk = qalloc(size, bits, ti);
         memcpy(blk.base, p, oldSize);
         return blk.base;
@@ -349,13 +455,12 @@ class VultureGC : GC
         if (!pool) return;
         if (pool.type == PoolType.HUGE)
         {
+            memTable.free(pool.mapped);
             metaLock.lock();
             pool.lock();
             memTable.deallocate(pool);
             pool.unlock();
             metaLock.unlock();
-            // TODO: just remove one pool
-            memTable.minimize();
             return;
         }
         else if (pool.type == PoolType.SMALL) {

@@ -1,6 +1,6 @@
 /*
     Vulture GC's pool table implementaiton.
-    Is a mojor part of GC metadata maintains a mapping
+    Is a major part of GC metadata maintains a mapping
     from 2MB memory chunks to GC's pools.
 */
 module vulture.pool_table;
@@ -67,6 +67,10 @@ nothrow @nogc:
         freelist = pool;
     }
 
+    void free(void[] mapping) {
+        freeMemory(mapping);
+    }
+
     Pool* opIndex(size_t idx) { return pools.ptr + idx; }
 
     size_t length() { return nextFreePool; }
@@ -117,7 +121,6 @@ nothrow @nogc:
         unmapMemory(pools);
     }
 
-private:
     void[] memory;
     void* memoryEnd;
     Pool[] pools;

@@ -5,7 +5,8 @@ import core.stdc.stdlib;
 import core.stdc.stdio;
 
 enum {
-    PAGESIZE = 4096
+    PAGESIZE = 4096,
+    MADV_FREE = 8
 }
 
 @nogc nothrow:
@@ -19,6 +20,14 @@ void[] mapMemory(size_t size) {
         abort();
     }
     return mem[0..roundedSize];
+}
+
+void freeMemory(void[] slice) {
+    auto ret = madvise(slice.ptr, slice.length, MADV_FREE);
+    if (ret < 0) {
+        perror("unable to free mmap area");
+        abort();
+    }
 }
 
 void unmapMemory(void[] slice) {

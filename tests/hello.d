@@ -18,9 +18,16 @@ module tests.hello;
 import vulture.gc;
 import core.gc.registry;
 
+import core.stdc.stdio;
 
 void main() {
-    new int[4];
+    auto arr = new int[4];
+	foreach (i; 0 .. 1000)
+	{
+		arr ~= i; 
+	}
+	printf("Arr[$-1] = %d\n", arr[$-1]);
 	new ubyte[2048];
-	new ubyte[32<<20];
+	auto huge = new ubyte[32<<20];
+	huge.length *= 2;
 }
