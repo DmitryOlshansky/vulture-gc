@@ -262,10 +262,11 @@ nothrow @nogc:
 
 // SMALL POOL implementations
     // small allocates in batches
-    SmallAllocBatch allocateSmall() {
+    SmallAllocBatch allocateSmall(ref size_t allocated) {
         auto remaining = small.objects - small.nextFree;
         size_t batchSize = remaining > SMALL_BATCH_SIZE ? SMALL_BATCH_SIZE : remaining;
         if (batchSize == 0) return SmallAllocBatch(null, null);
+        allocated = batchSize;
         size_t size = small.objectSize;
         void* start = cast(SmallAlloc*)(mapped.ptr + small.nextFree * size);
         void* end = start + batchSize * size;
@@ -337,15 +338,17 @@ nothrow @nogc:
         return small.markBits[b] & mask ? IsMarked.yes : IsMarked.no;
     }
 
-    SmallAllocBatch sweepSmall() {
+    SmallAllocBatch sweepSmall(ref size_t freed) {
         SmallAllocBatch batch;
         uint mask = 1;
         uint b = 0;
         size_t total = small.objects;
         size_t size = small.objectSize;
         void* ptr = mapped.ptr;
+        size_t freedLocal = 0;
         for (size_t idx = 0; idx < small.nextFree; idx++) {
             if (!(small.markBits[b] & mask)) {
+                freedLocal += size;
                 auto sm = cast(SmallAlloc*)ptr;
                 sm.attrsPtr = small.attrs + idx;
                 if (batch.tail) {
@@ -365,6 +368,7 @@ nothrow @nogc:
         if (batch.tail) {
             batch.tail.next = null;
         }
+        freed = freedLocal;
         return batch;
     }
 
@@ -504,11 +508,12 @@ nothrow @nogc:
         return large.markBits[b] & mask ? IsMarked.yes : IsMarked.no;
     }
 
-    void sweepLarge() {
+    void sweepLarge(ref size_t freed) {
         large.buckets[] = uint.max;
         size_t pages = large.pages;
         size_t b = 0;
         uint mask = 1;
+        size_t freedLocal;
         size_t runStart = size_t.max;
         for (size_t i = 0; i < pages; i++) {
             if (!(large.markBits[b] & mask)) {
@@ -518,6 +523,7 @@ nothrow @nogc:
             } else {
                 if (runStart != size_t.max) {
                     putToFreeList(cast(uint)runStart, cast(uint)(i - runStart));
+                    freedLocal += (i - runStart) * PAGESIZE;
                 }
                 runStart = size_t.max;
             }
@@ -527,6 +533,7 @@ nothrow @nogc:
                 b++;
             }
         }
+        freed = freedLocal;
     }
 
     void resetMarkBitsLarge() {
