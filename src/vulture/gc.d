@@ -134,6 +134,7 @@ class VultureGC : GC
     }
 
     void collectAllNoSync(bool noStack) nothrow {
+        debug(vulture) printf("Vulture GC collectstarted...");
         thread_suspendAll();
 
         prepare();
@@ -144,9 +145,11 @@ class VultureGC : GC
         thread_resumeAll();
 
         size_t usedBefore = usedTotal;
-        sweep();
-        size_t usedAfter = usedTotal;
-        collectThreshold = usedAfter * 2 + (usedBefore - usedAfter) / 5;
+        auto usage = sweep();
+        usedTotal = usage.used; // update after collection
+        size_t newThreshold = usage.used * 2 + (usedBefore - usage.used) / 5; // todo: config
+        collectThreshold = newThreshold < maxHeapSize ? newThreshold : maxHeapSize;
+        debug(vulture) printf("Vulture GC ended");
     }
 
     /**
@@ -320,26 +323,34 @@ class VultureGC : GC
         }
     }
 
-    void sweep() nothrow {
+    static struct MemUsage {
+        size_t free;
+        size_t used;
+    }
+
+    MemUsage sweep() nothrow {
         FreeList[sizeClasses.length][2] newFreeLists;
-        size_t freed = 0;
+        size_t free = 0, used = 0;
         for (size_t i = 0; i < memTable.length; i++) {
             auto pool = memTable[i];
             if (pool.type == PoolType.SMALL) {
                 auto clazz = sizeToClass(pool.small.objectSize);
-                auto listBatch = pool.sweepSmall(freed);
+                auto listBatch = pool.sweepSmall(free, used);
                 newFreeLists[pool.noScan][clazz].push(listBatch.head, listBatch.tail);
             } else if (pool.type == PoolType.LARGE) {
-                pool.sweepLarge(freed);
+                pool.sweepLarge(free, used);
             } else if (pool.type == PoolType.HUGE) {
                 if (!pool.huge.mark) {
+                    free += pool.mapped.length;
                     freeMemory(pool.mapped);
                     memTable.deallocate(pool);
+                } else {
+                    used += pool.mapped.length;
                 }
             }
         }
-        atomicOp!"-="(usedTotal, freed);
         freeLists = newFreeLists;
+        return MemUsage(free, used);
     }
 
     /**

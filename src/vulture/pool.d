@@ -338,14 +338,14 @@ nothrow @nogc:
         return small.markBits[b] & mask ? IsMarked.yes : IsMarked.no;
     }
 
-    SmallAllocBatch sweepSmall(ref size_t freed) {
+    SmallAllocBatch sweepSmall(ref size_t freed, ref size_t used) {
         SmallAllocBatch batch;
         uint mask = 1;
         uint b = 0;
         size_t total = small.objects;
         size_t size = small.objectSize;
         void* ptr = mapped.ptr;
-        size_t freedLocal = 0;
+        size_t freedLocal = 0, usedLocal = 0;
         for (size_t idx = 0; idx < small.nextFree; idx++) {
             if (!(small.markBits[b] & mask)) {
                 freedLocal += size;
@@ -357,6 +357,8 @@ nothrow @nogc:
                 } else {
                     batch.head = batch.tail = sm;
                 }
+            } else {
+                usedLocal += size;
             }
             ptr += size;
             mask <<= 1;
@@ -368,7 +370,8 @@ nothrow @nogc:
         if (batch.tail) {
             batch.tail.next = null;
         }
-        freed = freedLocal;
+        freed += freedLocal;
+        used += usedLocal;
         return batch;
     }
 
@@ -508,12 +511,12 @@ nothrow @nogc:
         return large.markBits[b] & mask ? IsMarked.yes : IsMarked.no;
     }
 
-    void sweepLarge(ref size_t freed) {
+    void sweepLarge(ref size_t freed, ref size_t used) {
         large.buckets[] = uint.max;
         size_t pages = large.pages;
         size_t b = 0;
         uint mask = 1;
-        size_t freedLocal;
+        size_t freedLocal  = 0, usedLocal = 0;
         size_t runStart = size_t.max;
         for (size_t i = 0; i < pages; i++) {
             if (!(large.markBits[b] & mask)) {
@@ -526,6 +529,7 @@ nothrow @nogc:
                     freedLocal += (i - runStart) * PAGESIZE;
                 }
                 runStart = size_t.max;
+                usedLocal += PAGESIZE;
             }
             mask <<=1;
             if (mask == (1<<8)) {
@@ -533,7 +537,8 @@ nothrow @nogc:
                 b++;
             }
         }
-        freed = freedLocal;
+        freed += freedLocal;
+        used += usedLocal;
     }
 
     void resetMarkBitsLarge() {
