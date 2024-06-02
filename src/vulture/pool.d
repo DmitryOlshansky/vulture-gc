@@ -5,6 +5,7 @@ import core.bitop;
 import core.internal.spinlock;
 import core.stdc.string;
 debug(vulture) import core.stdc.stdio;
+import core.thread.threadbase;
 
 import vulture.size_class, vulture.memory, vulture.fastdiv;
 
@@ -93,9 +94,7 @@ struct SmallAllocBatch {
 
 /// A set of pages organized into a bunch of free lists
 /// by size ranges. Granularity is 4K.
-struct LargePool
-{
-    uint largestFreeEstimate; // strictly >= largest free block, in bytes
+struct LargePool {
     uint pages;               // number of pages in this pool
     uint[BUCKETS] buckets;    // index of the first free run
     // offset serves double duty
@@ -111,8 +110,7 @@ struct LargePool
 /// A "pool" that represents single huge allocation.
 /// All requests to realloc or extend are forwarded to
 /// respective OS primitives. Granularity is one chunk - 2MB.
-struct HugePool
-{
+struct HugePool {
     size_t size;
     bool mark;
     bool finals;
@@ -120,10 +118,8 @@ struct HugePool
     bool appendable;
 }
 
-struct Pool
-{
-    union Impl
-    {
+struct Pool {
+    union Impl {
         SmallPool small;
         LargePool large;
         HugePool huge;
@@ -140,8 +136,7 @@ nothrow @nogc:
     @property ref large(){ return impl.large; }
     @property ref huge(){ return impl.huge; }
 
-    void initializeSmall(ubyte clazz, bool noScan)
-    {
+    void initializeSmall(ubyte clazz, bool noScan) {
         _lock = shared(SpinLock)(SpinLock.Contention.medium);
         this.noScan = noScan;
         this.type = PoolType.SMALL;
@@ -149,14 +144,13 @@ nothrow @nogc:
         small.objects = cast(uint)mapped.length / small.objectSize;
         small.multiplier = multiplier(small.objectSize);
         small.nextFree = 0;
-        small.attrs = cast(ubyte*)mapMemory(small.objectSize).ptr;
-        small.markBits = cast(ubyte*)mapMemory(small.objectSize / 8).ptr;
+        small.attrs = cast(ubyte*)mapMemory(small.objects).ptr;
+        small.markBits = cast(ubyte*)mapMemory((small.objects + 7) / 8).ptr;
     }
 
     void initializeLarge(bool noScan) {
         type = PoolType.LARGE;
         this.noScan = noScan;
-        large.largestFreeEstimate = cast(uint)(mapped.length);
         large.pages = cast(uint)(mapped.length / PAGESIZE);
         large.buckets[] = uint.max;
         large.offsetTable = cast(uint*)mapMemory(uint.sizeof *large.pages).ptr;
@@ -164,7 +158,7 @@ nothrow @nogc:
         large.attrs = cast(ubyte*)mapMemory(large.pages).ptr;
         large.markBits = cast(ubyte*)mapMemory(large.pages).ptr;
         // setup free lists as one big chunk of highest bucket
-        large.sizeTable[0] = (large.largestFreeEstimate + PAGESIZE-1) / PAGESIZE;
+        large.sizeTable[0] = (cast(uint)(mapped.length) + PAGESIZE-1) / PAGESIZE;
         large.offsetTable[0] = uint.max;
         large.buckets[BUCKETS-1] = 0;
     }
@@ -230,9 +224,16 @@ nothrow @nogc:
         assert(0);
     }
 
+    IsMarked isMarked(void *p) {
+        if (type == PoolType.SMALL) return isMarkedSmall(p);
+        else if (type == PoolType.LARGE) return isMarkedLarge(p);
+        else {
+            return huge.mark ? IsMarked.yes : IsMarked.no;
+        }
+    }
+
     // uint.max means same bits
-    BlkInfo tryExtend(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
-    {
+    BlkInfo tryExtend(void* p, size_t minSize, size_t maxSize, uint bits=uint.max) {
         if (type == PoolType.SMALL)
             return tryExtendSmall(p, minSize, maxSize, bits);
         else if(type == PoolType.LARGE)
@@ -241,11 +242,18 @@ nothrow @nogc:
             return tryExtendHuge(p, minSize, maxSize, bits);
     }
 
-    BlkInfo query(void* p)
-    {
+    BlkInfo query(void* p) {
         if (type == PoolType.SMALL) return querySmall(p);
         else if(type == PoolType.LARGE) return queryLarge(p);
         else return queryHuge(p);
+    }
+    
+    void resetMarkBits() {
+        if (type == PoolType.SMALL) return resetMarkBitsSmall();
+        else if (type == PoolType.LARGE) return resetMarkBitsLarge();
+        else {
+            huge.mark = false;
+        }
     }
 
     void runFinalizers(const void[] segment) {
@@ -321,17 +329,51 @@ nothrow @nogc:
         return mapped[offset .. offset + size];
     }
 
+    IsMarked isMarkedSmall(void *p) {
+        auto size = small.objectSize;
+        auto idx = divide(p - mapped.ptr, size);
+        auto b = idx/8;
+        auto mask = 1<<(idx % 8);
+        return small.markBits[b] & mask ? IsMarked.yes : IsMarked.no;
+    }
+
+    SmallAllocBatch sweepSmall() {
+        SmallAllocBatch batch;
+        uint mask = 1;
+        uint b = 0;
+        size_t total = small.objects;
+        size_t size = small.objectSize;
+        void* ptr = mapped.ptr;
+        for (size_t idx = 0; idx < small.nextFree; idx++) {
+            if (!(small.markBits[b] & mask)) {
+                auto sm = cast(SmallAlloc*)ptr;
+                sm.attrsPtr = small.attrs + idx;
+                if (batch.tail) {
+                    batch.tail.next = sm;
+                    batch.tail = sm;
+                } else {
+                    batch.head = batch.tail = sm;
+                }
+            }
+            ptr += size;
+            mask <<= 1;
+            if (mask == (1<<8)) {
+                mask = 1;
+                b++;
+            }
+        }
+        if (batch.tail) {
+            batch.tail.next = null;
+        }
+        return batch;
+    }
+
+    void resetMarkBitsSmall() {
+        small.markBits[0..(small.objects+7)/8] = 0;
+    }
+
     // uint.max means same bits
     BlkInfo tryExtendSmall(void* p, size_t minSize, size_t maxSize, uint bits=uint.max) {
-        debug(vulture) printf("Try extend small %ld .. %ld\n", minSize, maxSize);
-        size_t ourSize = small.objectSize;
-        if (minSize < ourSize) {
-            size_t newSize = ourSize > maxSize ? maxSize : ourSize;
-            uint offset = cast(uint)(p - mapped.ptr) / ourSize;
-            if (bits != uint.max)
-                small.attrs[offset] = attrToNibble(bits);
-            return BlkInfo(p, newSize, attrFromNibble(small.attrs[offset], noScan));
-        }
         return BlkInfo.init;
     }
 
@@ -340,6 +382,7 @@ nothrow @nogc:
         uint offset = cast(uint)(p - mapped.ptr) / small.objectSize;
         return BlkInfo(base, small.objectSize, attrFromNibble(small.attrs[offset], noScan));
     }
+    
 
 // LARGE POOL implementations
     uint startOfLarge(void* p) {
@@ -361,15 +404,14 @@ nothrow @nogc:
 
         BlkInfo cutOut(uint start) nothrow
         {
-            for (uint i = start; i < start + psize; i++)
+            for (uint i = start; i < start + psize; i++) {
                 large.offsetTable[i] = start;
-            large.sizeTable[start] = psize;
+                large.sizeTable[i] = psize;
+            }
             BlkInfo blk;
             blk.base = mapped.ptr + start*PAGESIZE;
             blk.size = psize * PAGESIZE;
             blk.attr = bits;
-            // TODO: set attr metadata
-            debug(vulture) printf("large.attrs = %p\n", large.attrs);
             large.attrs[start] = attrToNibble(bits);
             return blk;
         }
@@ -455,15 +497,49 @@ nothrow @nogc:
         return mapped[start*PAGESIZE..(start+size)*PAGESIZE];
     }
 
+    IsMarked isMarkedLarge(void *p) {
+        uint start = startOfLarge(p);
+        auto b = start / 8;
+        uint mask = 1<<(start % 8);
+        return large.markBits[b] & mask ? IsMarked.yes : IsMarked.no;
+    }
+
+    void sweepLarge() {
+        large.buckets[] = uint.max;
+        size_t pages = large.pages;
+        size_t b = 0;
+        uint mask = 1;
+        size_t runStart = size_t.max;
+        for (size_t i = 0; i < pages; i++) {
+            if (!(large.markBits[b] & mask)) {
+                if (runStart == size_t.max) {
+                    runStart = i;
+                }
+            } else {
+                if (runStart != size_t.max) {
+                    putToFreeList(cast(uint)runStart, cast(uint)(i - runStart));
+                }
+                runStart = size_t.max;
+            }
+            mask <<=1;
+            if (mask == (1<<8)) {
+                mask = 1;
+                b++;
+            }
+        }
+    }
+
+    void resetMarkBitsLarge() {
+        large.markBits[0..large.pages] = 0;
+    }
+
     // uint.max means same bits
-    BlkInfo tryExtendLarge(void* p, size_t minSize, size_t maxSize, uint bits=uint.max)
-    {
+    BlkInfo tryExtendLarge(void* p, size_t minSize, size_t maxSize, uint bits=uint.max) {
         //TODO: check if followed by free space, extend + readd it from free lists
         return BlkInfo.init;
     }
 
-    BlkInfo queryLarge(void* p)
-    {
+    BlkInfo queryLarge(void* p) {
         uint s = startOfLarge(p);
         void* base = mapped.ptr + s*PAGESIZE;
         uint size = large.sizeTable[s]*PAGESIZE;

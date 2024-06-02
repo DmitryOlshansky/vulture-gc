@@ -9,6 +9,8 @@ import core.gc.registry;
 import core.lifetime;
 import core.stdc.stdlib;
 import core.sys.linux.sys.sysinfo;
+import core.thread.threadbase;
+import core.thread.osthread;
 
 import vulture.memory;
 import vulture.pool_table;
@@ -61,14 +63,31 @@ class VultureGC : GC
         metaLock = shared(SpinLock)(SpinLock.Contention.brief);
         memTable = MemoryTable(memorySize);
         import core.stdc.stdio;
-        printf("Vulture GC initialized\n");
+        debug(vulture) printf("Vulture GC initialized\n");
     }
+
     /*
      *
      */
     void Dtor()
     {
         memTable.Dtor();
+    }
+
+    void lockAll() nothrow {
+        metaLock.lock();
+        foreach (size_t i; 0 .. memTable.length) {
+            auto pool = memTable[i];
+            pool.lock();
+        }
+    }
+
+    void unlockAll() nothrow {
+        foreach (size_t i; 0 .. memTable.length) {
+            auto pool = memTable[i];
+            pool.unlock();
+        }
+        metaLock.unlock();
     }
 
     /**
@@ -94,49 +113,75 @@ class VultureGC : GC
     /**
      *
      */
-    void collect() nothrow
-    {
-        //TODO: collection ;)
+    void collect() nothrow {
+        lockAll();
+        scope(exit) unlockAll();
+        collectAllNoSync(false);
     }
 
     /**
      *
      */
-    void collectNoStack() nothrow
-    {
-        //TODO: collection ;)
+    void collectNoStack() nothrow {
+        lockAll();
+        scope(exit) unlockAll();
+        collectAllNoSync(true);
     }
 
-    static struct ToScanStack
-    {
+    void collectAllNoSync(bool noStack) nothrow {
+        thread_suspendAll();
+
+        prepare();
+
+        markAll(noStack);
+
+        thread_processGCMarks(&isMarked);
+        thread_resumeAll();
+
+        sweep();
+    }
+
+    /**
+     * Returns true if the addr lies within a marked block.
+     *
+     * Warning! This should only be called while the world is stopped inside
+     * the fullcollect function.
+     */
+    int isMarked(void *addr) scope nothrow {
+        // first, we find the Pool this block is in, then check to see if the
+        // mark bit is clear.
+        auto pool = memTable.lookup(addr);
+        if(pool) {
+            return pool.isMarked(addr);
+        }
+        return IsMarked.unknown;
+    }
+
+    static struct ToScanStack {
     nothrow:
         @disable this(this);
 
-        void reset()
-        {
+        void reset() {
             _length = 0;
             unmapMemory(_p[0 .._cap * Range.sizeof]);
             _p = null;
             _cap = 0;
         }
 
-        void push(Range rng)
-        {
+        void push(Range rng) {
             if (_length == _cap) grow();
             _p[_length++] = rng;
         }
 
         Range pop()
         in { assert(!empty); }
-        body
-        {
+        body {
             return _p[--_length];
         }
 
         ref inout(Range) opIndex(size_t idx) inout
         in { assert(idx < _length); }
-        body
-        {
+        body {
             return _p[idx];
         }
 
@@ -144,8 +189,7 @@ class VultureGC : GC
         @property bool empty() const { return !length; }
 
     private:
-        void grow()
-        {
+        void grow() {
             enum initSize = 64 * 1024; // Windows VirtualAlloc granularity
             immutable ncap = _cap ? 2 * _cap : initSize / Range.sizeof;
             auto p = cast(Range*)mapMemory(ncap * Range.sizeof);
@@ -230,11 +274,68 @@ class VultureGC : GC
         goto Lagain;
     }
 
+    // stage 0 of collection
+    void prepare() nothrow {
+        foreach (block; freeLists[]){
+            block[] = FreeList.init; // null out free lists
+        }
+        for (size_t i = 0; i < memTable.length; i++) {
+            auto pool = memTable[i];
+            if (pool.type != PoolType.NONE) {
+                pool.resetMarkBits();
+            }
+        }
+    }
+
+    void markAll(bool noStack) nothrow {
+        if (!noStack)
+        {
+            debug(vulture) printf("Scan stacks\n");
+            // Scan stacks and registers for each paused thread
+            thread_scanAll(&mark);
+        }
+
+        // Scan roots[]
+        debug(vulture) printf("Scan roots[]\n");
+        foreach (root; roots)
+        {
+            mark(cast(void*)&root.proot, cast(void*)(&root.proot + 1));
+        }
+
+        // Scan ranges[]
+        debug(vulture) printf("Scan ranges[]\n");
+        //log++;
+        foreach (range; ranges)
+        {
+            debug(vulture) printf("\t%p .. %p\n", range.pbot, range.ptop);
+            mark(range.pbot, range.ptop);
+        }
+    }
+
+    void sweep() nothrow {
+        FreeList[sizeClasses.length][2] newFreeLists;
+        for (size_t i = 0; i < memTable.length; i++) {
+            auto pool = memTable[i];
+            if (pool.type == PoolType.SMALL) {
+                auto clazz = sizeToClass(pool.small.objectSize);
+                auto listBatch = pool.sweepSmall();
+                newFreeLists[pool.noScan][clazz].push(listBatch.head, listBatch.tail);
+            } else if (pool.type == PoolType.LARGE) {
+                pool.sweepLarge();
+            } else if (pool.type == PoolType.HUGE) {
+                if (!pool.huge.mark) {
+                    freeMemory(pool.mapped);
+                    memTable.deallocate(pool);
+                }
+            }
+        }
+        freeLists = newFreeLists;
+    }
+
     /**
      * minimize free space usage
      */
-    void minimize() nothrow
-    {
+    void minimize() nothrow {
         metaLock.lock();
         scope(exit) metaLock.unlock();
         memTable.minimize();
@@ -243,55 +344,56 @@ class VultureGC : GC
     /**
      *
      */
-    uint getAttr(void* p) nothrow
-    {
+    uint getAttr(void* p) nothrow {
         if (!p) return 0;
         metaLock.lock();
         scope(exit) metaLock.unlock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return 0;
+        pool.lock();
+        scope(exit) pool.unlock();
         return pool.getAttr(p);
     }
 
     /**
      *
      */
-    uint setAttr(void* p, uint mask) nothrow
-    {
+    uint setAttr(void* p, uint mask) nothrow {
         if (!p) return 0;
         metaLock.lock();
         scope(exit) metaLock.unlock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return 0;
+        pool.lock();
+        scope(exit) pool.unlock();
         return pool.setAttr(p, mask);
     }
 
     /**
      *
      */
-    uint clrAttr(void* p, uint mask) nothrow
-    {
+    uint clrAttr(void* p, uint mask) nothrow {
         if (!p) return 0;
         metaLock.lock();
         scope(exit) metaLock.unlock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return 0;
+        pool.lock();
+        scope(exit) pool.unlock();
         return pool.clrAttr(p, mask);
     }
 
     /**
      *
      */
-    void* malloc(size_t size, uint bits, const TypeInfo ti) nothrow
-    {
+    void* malloc(size_t size, uint bits, const TypeInfo ti) nothrow {
         return qalloc(size, bits, ti).base;
     }
 
     /*
      *
      */
-    BlkInfo qalloc(size_t size, uint bits, const scope TypeInfo ti) nothrow
-    {
+    BlkInfo qalloc(size_t size, uint bits, const scope TypeInfo ti) nothrow {
         // Check TypeInfo "should scan" bit
         if (ti && !(ti.flags() & 1)) bits |= BlkAttr.NO_SCAN;
         if (size <= MAXSMALL) return smallAlloc(size, bits);
@@ -302,13 +404,11 @@ class VultureGC : GC
     /*
      *
      */
-    void* calloc(size_t size, uint bits, const TypeInfo ti) nothrow
-    {
+    void* calloc(size_t size, uint bits, const TypeInfo ti) nothrow {
         return qalloc(size, bits, ti).base;
     }
 
-    BlkInfo smallAlloc(size_t size, uint bits) nothrow
-    {
+    BlkInfo smallAlloc(size_t size, uint bits) nothrow {
         debug(vulture) printf("Allocating small %ld (%x)\n", size, bits);
         ubyte sclass = sizeToClass(size);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
@@ -340,6 +440,7 @@ class VultureGC : GC
                     if (fromFreeList) break;
                 }
             }
+            // TODO: maybe GC
             auto pool = memTable.allocate(CHUNKSIZE);
             pool.lock();
             metaLock.unlock();
@@ -353,27 +454,21 @@ class VultureGC : GC
         return BlkInfo(fromFreeList, size, bits); 
     }
 
-    BlkInfo largeAlloc(size_t size, uint bits) nothrow
-    {
+    BlkInfo largeAlloc(size_t size, uint bits) nothrow {
         debug(vulture) printf("Allocating large %ld (%x)\n", size, bits);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
         metaLock.lock();
-        foreach(i; 0..memTable.length)
-        {
+        foreach(i; 0..memTable.length) {
             auto p = memTable[i];
             // Quick check of immutable properties w/o locking
-            if (p.type == PoolType.LARGE && p.noScan == noScan)
-            {
+            if (p.type == PoolType.LARGE && p.noScan == noScan) {
                 p.lock();
                 scope(exit) p.unlock();
-                if (p.large.largestFreeEstimate >= size)
-                {
-                    metaLock.unlock();
-                    auto blk = p.allocateLarge(size, bits);
-                    if (blk.base) return blk;
-                    // estimate was wrong, continue
-                    metaLock.lock();
-                }
+                metaLock.unlock();
+                auto blk = p.allocateLarge(size, bits);
+                if (blk.base) return blk;
+                // estimate was wrong, continue
+                metaLock.lock();
             }
         }
         // TODO: maybe GC
@@ -388,8 +483,7 @@ class VultureGC : GC
         return pool.allocateLarge(size, bits);
     }
 
-    BlkInfo hugeAlloc(size_t size, uint bits) nothrow
-    {
+    BlkInfo hugeAlloc(size_t size, uint bits) nothrow {
         metaLock.lock();
         scope(exit) metaLock.unlock();
         Pool* p = memTable.allocate(size);
@@ -399,8 +493,7 @@ class VultureGC : GC
     /*
      *
      */
-    void* realloc(void* p, size_t size, uint bits, const TypeInfo ti) nothrow
-    {
+    void* realloc(void* p, size_t size, uint bits, const TypeInfo ti) nothrow {
         debug(vulture) printf("GC realloc %ld\n", size);
         Pool* pool = memTable.lookup(p);
         if (!pool) return qalloc(size, bits, ti).base;
@@ -426,8 +519,7 @@ class VultureGC : GC
      *  0 if could not extend p,
      *  total size of entire memory block if successful.
      */
-    size_t extend(void* p, size_t minsize, size_t maxsize, const TypeInfo ti) nothrow
-    {
+    size_t extend(void* p, size_t minsize, size_t maxsize, const TypeInfo ti) nothrow {
         metaLock.lock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return 0;
@@ -441,16 +533,14 @@ class VultureGC : GC
     /**
      *
      */
-    size_t reserve(size_t size) nothrow
-    {
+    size_t reserve(size_t size) nothrow {
         return size;
     }
 
     /**
      *
      */
-    void free(void* p) nothrow
-    {
+    void free(void* p) nothrow {
         Pool* pool = memTable.lookup(p);
         if (!pool) return;
         if (pool.type == PoolType.HUGE)
@@ -478,8 +568,7 @@ class VultureGC : GC
      * Determine the base address of the block containing p.  If p is not a gc
      * allocated pointer, return null.
      */
-    void* addrOf(void* p) nothrow
-    {
+    void* addrOf(void* p) nothrow {
         metaLock.lock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return null;
@@ -508,8 +597,7 @@ class VultureGC : GC
      * Determine the base address of the block containing p.  If p is not a gc
      * allocated pointer, return null.
      */
-    BlkInfo query(void* p) nothrow
-    {
+    BlkInfo query(void* p) nothrow {
         metaLock.lock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return BlkInfo.init;
@@ -523,8 +611,7 @@ class VultureGC : GC
      * Retrieve statistics about garbage collection.
      * Useful for debugging and tuning.
      */
-    Stats stats() nothrow
-    {
+    Stats stats() nothrow {
         return Stats.init; // TODO: statistics
     }
 
@@ -535,8 +622,7 @@ class VultureGC : GC
     /**
      * add p to list of roots
      */
-    void addRoot(void* p) nothrow @nogc
-    {
+    void addRoot(void* p) nothrow @nogc {
         if(!p) return;
         rootsLock.lock();
         scope (exit) rootsLock.unlock();
@@ -546,8 +632,7 @@ class VultureGC : GC
     /**
      * remove p from list of roots
      */
-    void removeRoot(void* p) nothrow @nogc
-    {
+    void removeRoot(void* p) nothrow @nogc {
         if(!p) return;
         rootsLock.lock();
         scope (exit) rootsLock.unlock();
@@ -557,13 +642,11 @@ class VultureGC : GC
     /**
      *
      */
-    @property RootIterator rootIter() @nogc
-    {
+    @property RootIterator rootIter() @nogc {
         return &this.rootsApply;
     }
 
-    int rootsApply(scope int delegate(ref Root) nothrow dg) nothrow
-    {
+    int rootsApply(scope int delegate(ref Root) nothrow dg) nothrow {
         rootsLock.lock();
         scope (exit) rootsLock.unlock();
         auto ret = roots.opApply(dg);
@@ -573,8 +656,7 @@ class VultureGC : GC
     /**
      * add range to scan for roots
      */
-    void addRange(void* p, size_t sz, const TypeInfo ti) nothrow @nogc
-    {
+    void addRange(void* p, size_t sz, const TypeInfo ti) nothrow @nogc {
         if(!p || !sz) return;
         rangesLock.lock();
         scope (exit) rangesLock.unlock();
@@ -584,8 +666,7 @@ class VultureGC : GC
     /**
      * remove range
      */
-    void removeRange(void *pbot) nothrow @nogc
-    {
+    void removeRange(void *pbot) nothrow @nogc {
         if(!pbot) return;
         rangesLock.lock();
         scope (exit) rangesLock.unlock();
@@ -595,13 +676,11 @@ class VultureGC : GC
     /**
      *
      */
-    @property RangeIterator rangeIter() @nogc
-    {
+    @property RangeIterator rangeIter() @nogc {
         return &this.rangesApply;
     }
 
-    int rangesApply(scope int delegate(ref Range) nothrow dg) nothrow
-    {
+    int rangesApply(scope int delegate(ref Range) nothrow dg) nothrow {
         rangesLock.lock();
         scope (exit) rangesLock.unlock();
         auto ret = ranges.opApply(dg);
@@ -615,8 +694,7 @@ class VultureGC : GC
     /**
      * run finalizers
      */
-    void runFinalizers(scope const(void[]) segment) nothrow
-    {
+    void runFinalizers(scope const(void[]) segment) nothrow {
         metaLock.lock();
         _inFinalizer = true;
         scope (exit)
@@ -633,8 +711,7 @@ class VultureGC : GC
     /*
      *
      */
-    bool inFinalizer() nothrow
-    {
+    bool inFinalizer() nothrow {
         metaLock.lock();
         scope(exit) metaLock.unlock();
         return _inFinalizer;
