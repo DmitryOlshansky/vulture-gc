@@ -78,18 +78,40 @@ struct SmallPool
     uint objectSize;   // size of objects in this pool
     uint nextFree;     // index of next free object batch
     size_t multiplier; // fast div multiplier
+    ubyte* allocBits;  // bits of allocated objects
     ubyte* markBits;   // granularity is per object
     ubyte* attrs;      // granularity is per object
 }
 
 struct SmallAlloc {
-    void* next;
-    ubyte* attrsPtr;
+    void* ptr;
+    ubyte* attrs;
 }
 
 struct SmallAllocBatch {
-    SmallAlloc* head;
-    SmallAlloc* tail;
+    void[] memory;
+    ubyte* attrs;
+    size_t size;
+    void* ptr;
+    ubyte allocBits, mask;
+
+    SmallAlloc alloc() nothrow pure @nogc {
+        while (mask < (1<<8)) {
+            if (!(mask & allocBits)) {
+                auto ret = ptr;
+                auto attrsRet = attrs;
+                ptr += size;
+                attrs++;
+                mask <<= 1;
+                return SmallAlloc(ret, attrsRet);
+            }
+            mask <<= 1;
+            attrs++;
+            ptr += size;
+            
+        }
+        return SmallAlloc.init;
+    }
 }
 
 /// A set of pages organized into a bunch of free lists
@@ -146,6 +168,7 @@ nothrow @nogc:
         small.nextFree = 0;
         small.attrs = cast(ubyte*)mapMemory(small.objects).ptr;
         small.markBits = cast(ubyte*)mapMemory((small.objects + 7) / 8).ptr;
+        small.allocBits = cast(ubyte*)mapMemory((small.objects + 7) / 8).ptr;
     }
 
     void initializeLarge(bool noScan) {
@@ -263,28 +286,19 @@ nothrow @nogc:
 // SMALL POOL implementations
     // small allocates in batches
     SmallAllocBatch allocateSmall(ref size_t allocated) {
-        auto remaining = small.objects - small.nextFree;
-        size_t batchSize = remaining > SMALL_BATCH_SIZE ? SMALL_BATCH_SIZE : remaining;
-        if (batchSize == 0) return SmallAllocBatch(null, null);
-        allocated = batchSize;
-        size_t size = small.objectSize;
-        void* start = cast(SmallAlloc*)(mapped.ptr + small.nextFree * size);
-        void* end = start + batchSize * size;
         debug(vulture) printf("smallAlloc %p %p\n", mapped.ptr, mapped.ptr + mapped.length);
-        ubyte* attrsPtr = small.attrs + small.nextFree;
-        for(void* p = start; p < end; p += size) {
-            auto sp = cast(SmallAlloc*)p;
-            if (p != end - size) {
-                sp.next = p + size;
+        for (size_t i = small.nextFree; i < small.objects; i+= 8) {
+            auto allocByte = small.allocBits[i / 8];
+            if (allocByte != 0xFF) {
+                small.allocBits[i / 8] = 0xFF;
+                small.nextFree = cast(uint)i + 8;
+                size_t size = small.objectSize;
+                allocated = 8 - popcnt(allocByte);
+                auto ptr = mapped.ptr + i * size;
+                return SmallAllocBatch(ptr[0 .. 8 * size], small.attrs + i, size, ptr, allocByte, 1);
             }
-            else {
-                sp.next = null;
-            }
-            sp.attrsPtr = attrsPtr++;
         }
-        small.nextFree += batchSize;
-        debug(vulture) printf("smallAlloc %p %p\n", start, end);
-        return SmallAllocBatch(cast(SmallAlloc*)start, cast(SmallAlloc*)(end - size));
+        return SmallAllocBatch.init;
     }
 
     uint getAttrSmall(void* p) {
@@ -338,41 +352,22 @@ nothrow @nogc:
         return small.markBits[b] & mask ? IsMarked.yes : IsMarked.no;
     }
 
-    SmallAllocBatch sweepSmall(ref size_t freed, ref size_t used) {
-        SmallAllocBatch batch;
-        uint mask = 1;
-        uint b = 0;
-        size_t total = small.objects;
-        size_t size = small.objectSize;
-        void* ptr = mapped.ptr;
+    void sweepSmall(ref size_t freed, ref size_t used) {
         size_t freedLocal = 0, usedLocal = 0;
-        for (size_t idx = 0; idx < small.nextFree; idx++) {
-            if (!(small.markBits[b] & mask)) {
-                freedLocal += size;
-                auto sm = cast(SmallAlloc*)ptr;
-                sm.attrsPtr = small.attrs + idx;
-                if (batch.tail) {
-                    batch.tail.next = sm;
-                    batch.tail = sm;
-                } else {
-                    batch.head = batch.tail = sm;
-                }
+        size_t len = (small.objects + 7) / 8;
+        for (size_t i = 0; i<len; i++) {
+            if (small.markBits[i]) {
+                auto live = popcnt(small.markBits[i]);
+                freedLocal += 8 - live;
+                usedLocal += live;
             } else {
-                usedLocal += size;
+                freedLocal += 8;
             }
-            ptr += size;
-            mask <<= 1;
-            if (mask == (1<<8)) {
-                mask = 1;
-                b++;
-            }
+            small.allocBits[i] = small.markBits[i];
         }
-        if (batch.tail) {
-            batch.tail.next = null;
-        }
+        small.nextFree = 0;
         freed += freedLocal;
         used += usedLocal;
-        return batch;
     }
 
     void resetMarkBitsSmall() {

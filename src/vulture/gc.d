@@ -41,6 +41,10 @@ GC createVulture() {
     return ptr;
 }
 
+private struct TlsCache {
+    SmallAllocBatch[sizeClasses.length][2] cache;
+}
+
 class VultureGC : GC
 {
     auto rootsLock = shared(AlignedSpinLock)(SpinLock.Contention.brief);
@@ -52,7 +56,7 @@ class VultureGC : GC
     size_t enabled = 1;        
     bool _inFinalizer = false;
     size_t[2] numLargePools;
-    FreeList[sizeClasses.length][2] freeLists;
+    static TlsCache tcache;
     shared size_t usedTotal;
     shared size_t collectThreshold;
     shared size_t maxHeapSize;
@@ -134,7 +138,7 @@ class VultureGC : GC
     }
 
     void collectAllNoSync(bool noStack) nothrow {
-        debug(vulture) printf("Vulture GC collectstarted...");
+        debug(vulture) printf("Vulture GC collect started...\n");
         thread_suspendAll();
 
         prepare();
@@ -287,9 +291,6 @@ class VultureGC : GC
 
     // stage 0 of collection
     void prepare() nothrow {
-        foreach (block; freeLists[]){
-            block[] = FreeList.init; // null out free lists
-        }
         for (size_t i = 0; i < memTable.length; i++) {
             auto pool = memTable[i];
             if (pool.type != PoolType.NONE) {
@@ -329,14 +330,11 @@ class VultureGC : GC
     }
 
     MemUsage sweep() nothrow {
-        FreeList[sizeClasses.length][2] newFreeLists;
         size_t free = 0, used = 0;
         for (size_t i = 0; i < memTable.length; i++) {
             auto pool = memTable[i];
             if (pool.type == PoolType.SMALL) {
-                auto clazz = sizeToClass(pool.small.objectSize);
-                auto listBatch = pool.sweepSmall(free, used);
-                newFreeLists[pool.noScan][clazz].push(listBatch.head, listBatch.tail);
+                pool.sweepSmall(free, used);
             } else if (pool.type == PoolType.LARGE) {
                 pool.sweepLarge(free, used);
             } else if (pool.type == PoolType.HUGE) {
@@ -349,7 +347,6 @@ class VultureGC : GC
                 }
             }
         }
-        freeLists = newFreeLists;
         return MemUsage(free, used);
     }
 
@@ -433,20 +430,18 @@ class VultureGC : GC
         debug(vulture) printf("Allocating small %ld (%x)\n", size, bits);
         ubyte sclass = sizeToClass(size);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
-        auto freelist = &freeLists[noScan][sclass];
-        auto fromFreeList = freelist.pop();
-        SmallAlloc* allocateRun(Pool* pool, ref size_t allocated) {
+        auto cache =  &tcache.cache[noScan][sclass];
+        auto fromCache = cache.alloc();
+        SmallAlloc allocateRun(Pool* pool, ref size_t allocated) {
             debug (vulture) printf("Allocating small batch\n");
             auto batch = pool.allocateSmall(allocated);
-            debug (vulture) printf("Allocated small batch %p %p\n", batch.head, batch.tail);
-            if (batch.head != null) {
-                if (batch.head != batch.tail)
-                    freelist.push(batch.head.next, batch.tail);
-                return batch.head;
+            if (batch.ptr != null) {
+                *cache = batch;
+                return cache.alloc();
             }
-            return null;
+            return SmallAlloc.init;
         }
-        if (!fromFreeList) {
+        if (!fromCache.ptr) {
             size_t objectSize = classToSize(sclass);
             metaLock.lock();
             // todo: circular doubly-linked list of small pools by size class
@@ -460,8 +455,8 @@ class VultureGC : GC
                     pool.lock();
                     candidates++;
                     scope(exit) pool.unlock();
-                    fromFreeList = allocateRun(pool, allocatedBytes);
-                    if (fromFreeList) {
+                    fromCache = allocateRun(pool, allocatedBytes);
+                    if (fromCache.ptr) {
                         atomicOp!"+="(usedTotal, allocatedBytes);
                         break;
                     }
@@ -479,13 +474,13 @@ class VultureGC : GC
                 metaLock.unlock();
                 debug(vulture) printf("Initializing small pool\n");
                 pool.initializeSmall(sclass, noScan);
-                fromFreeList = allocateRun(pool, allocatedBytes);
+                fromCache = allocateRun(pool, allocatedBytes);
                 atomicOp!"+="(usedTotal, allocatedBytes);
                 pool.unlock();
             }
         }
-        *(cast(SmallAlloc*)fromFreeList).attrsPtr = attrToNibble(bits);
-        return BlkInfo(fromFreeList, size, bits); 
+        *fromCache.attrs = attrToNibble(bits);
+        return BlkInfo(fromCache.ptr, size, bits); 
     }
 
     BlkInfo largeAlloc(size_t size, uint bits) nothrow {
@@ -602,10 +597,7 @@ class VultureGC : GC
             return;
         }
         else if (pool.type == PoolType.SMALL) {
-            SmallAlloc* alloc = cast(SmallAlloc*)p;
-            alloc.attrsPtr = pool.small.attrs + (p - pool.mapped.ptr) / pool.small.objectSize;
-            auto clazz = sizeToClass(pool.small.objectSize);
-            freeLists[pool.noScan][clazz].push(alloc);
+            // noop - todo clear allocBit
         }
         pool.lock();
         scope(exit) pool.unlock();
