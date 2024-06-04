@@ -432,6 +432,7 @@ class VultureGC : GC
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
         auto cache =  &tcache.cache[noScan][sclass];
         auto fromCache = cache.alloc();
+        debug(vulture) printf("Allocated from cache %ld (%x)\n", size, bits);
         SmallAlloc allocateRun(Pool* pool, ref size_t allocated) {
             debug (vulture) printf("Allocating small batch\n");
             auto batch = pool.allocateSmall(allocated);

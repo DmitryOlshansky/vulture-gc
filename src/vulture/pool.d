@@ -93,9 +93,11 @@ struct SmallAllocBatch {
     ubyte* attrs;
     size_t size;
     void* ptr;
-    ubyte allocBits, mask;
+    uint mask;
+    ubyte allocBits;
 
     SmallAlloc alloc() nothrow pure @nogc {
+        if (ptr == null) return SmallAlloc.init;
         while (mask < (1<<8)) {
             if (!(mask & allocBits)) {
                 auto ret = ptr;
@@ -295,9 +297,10 @@ nothrow @nogc:
                 size_t size = small.objectSize;
                 allocated = 8 - popcnt(allocByte);
                 auto ptr = mapped.ptr + i * size;
-                return SmallAllocBatch(ptr[0 .. 8 * size], small.attrs + i, size, ptr, allocByte, 1);
+                return SmallAllocBatch(ptr[0 .. 8 * size], small.attrs + i, size, ptr, 1, allocByte);
             }
         }
+        small.nextFree = small.objects;
         return SmallAllocBatch.init;
     }
 
