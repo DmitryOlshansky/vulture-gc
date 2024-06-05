@@ -431,8 +431,14 @@ class VultureGC : GC
         ubyte sclass = sizeToClass(size);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
         auto cache =  &tcache.cache[noScan][sclass];
-        auto fromCache = cache.alloc();
-        debug(vulture) printf("Allocated from cache %ld (%x)\n", size, bits);
+        auto alloc = cache.alloc();
+        debug(vulture) printf("Allocated from cache %p\n", alloc.ptr);
+        if (!alloc.ptr) alloc = smallAllocSlowPath(sclass, noScan, cache);
+        *alloc.attrs = attrToNibble(bits);
+        return BlkInfo(alloc.ptr, size, bits); 
+    }
+
+    SmallAlloc smallAllocSlowPath(ubyte sclass, bool noScan, SmallAllocBatch* cache) nothrow {
         SmallAlloc allocateRun(Pool* pool, ref size_t allocated) {
             debug (vulture) printf("Allocating small batch\n");
             auto batch = pool.allocateSmall(allocated);
@@ -442,46 +448,44 @@ class VultureGC : GC
             }
             return SmallAlloc.init;
         }
-        if (!fromCache.ptr) {
-            size_t objectSize = classToSize(sclass);
-            metaLock.lock();
-            // todo: circular doubly-linked list of small pools by size class
-            size_t i = 0;
-            size_t candidates;
-            size_t allocatedBytes = 0;
-            for (i=0; i < memTable.length; i++) {
-                auto pool = memTable[i];
-                if (pool.type == PoolType.SMALL && pool.small.objectSize == objectSize) {
-                    metaLock.unlock();
-                    pool.lock();
-                    candidates++;
-                    scope(exit) pool.unlock();
-                    fromCache = allocateRun(pool, allocatedBytes);
-                    if (fromCache.ptr) {
-                        atomicOp!"+="(usedTotal, allocatedBytes);
-                        break;
-                    }
-                    else metaLock.lock();
-                }
-            }
-            if (i == memTable.length) {
-                if (candidates >= 1 && atomicLoad(usedTotal) > collectThreshold) {
-                    metaLock.unlock();
-                    collect();
-                    return smallAlloc(size, bits);
-                }
-                auto pool = memTable.allocate(CHUNKSIZE);
-                pool.lock();
+        size_t objectSize = classToSize(sclass);
+        metaLock.lock();
+        // todo: circular doubly-linked list of small pools by size class
+        size_t i = 0;
+        size_t candidates;
+        size_t allocatedBytes = 0;
+        SmallAlloc alloc;
+        for (i=0; i < memTable.length; i++) {
+            auto pool = memTable[i];
+            if (pool.type == PoolType.SMALL && pool.small.objectSize == objectSize) {
                 metaLock.unlock();
-                debug(vulture) printf("Initializing small pool\n");
-                pool.initializeSmall(sclass, noScan);
-                fromCache = allocateRun(pool, allocatedBytes);
-                atomicOp!"+="(usedTotal, allocatedBytes);
-                pool.unlock();
+                pool.lock();
+                candidates++;
+                scope(exit) pool.unlock();
+                alloc = allocateRun(pool, allocatedBytes);
+                if (alloc.ptr) {
+                    atomicOp!"+="(usedTotal, allocatedBytes);
+                    break;
+                }
+                else metaLock.lock();
             }
         }
-        *fromCache.attrs = attrToNibble(bits);
-        return BlkInfo(fromCache.ptr, size, bits); 
+        if (i == memTable.length) {
+            if (candidates >= 1 && atomicLoad(usedTotal) > collectThreshold) {
+                metaLock.unlock();
+                collect();
+                return smallAllocSlowPath(sclass, noScan, cache);
+            }
+            auto pool = memTable.allocate(CHUNKSIZE);
+            pool.lock();
+            metaLock.unlock();
+            debug(vulture) printf("Initializing small pool\n");
+            pool.initializeSmall(sclass, noScan);
+            alloc = allocateRun(pool, allocatedBytes);
+            atomicOp!"+="(usedTotal, allocatedBytes);
+            pool.unlock();
+        }
+        return alloc;
     }
 
     BlkInfo largeAlloc(size_t size, uint bits) nothrow {
