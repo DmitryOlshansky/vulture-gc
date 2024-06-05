@@ -127,5 +127,5 @@ nothrow @nogc:
     Pool*[] poolMap;
     Pool* freelist;
     size_t nextFreePool;    // in Pool.sizeof increments 
-    size_t memoryNextFree;  // in CHUNSIZE increments
+    size_t memoryNextFree;  // in CHUNKSIZE increments
 }
