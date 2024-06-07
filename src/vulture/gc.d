@@ -1,7 +1,6 @@
 module vulture.gc;
 
 import core.atomic;
-import core.internal.spinlock;
 import core.stdc.string;
 debug(vulture) import core.stdc.stdio;
 static import core.memory;
@@ -14,6 +13,7 @@ import core.thread.threadbase;
 import core.thread.osthread;
 
 import vulture.memory;
+import vulture.spinlock;
 import vulture.pool_table;
 import vulture.pool;
 import vulture.size_class;
@@ -51,25 +51,26 @@ class VultureGC : GC
     auto rangesLock = shared(AlignedSpinLock)(SpinLock.Contention.brief);
     Treap!Root roots;
     Treap!Range ranges;
-    shared SpinLock metaLock;   // Lock around most of GC metadata including memTable
     MemoryTable memTable;       // table of pool allocations
     size_t enabled = 1;        
     bool _inFinalizer = false;
+    size_t[sizeClasses.length+1][2] lastSuccessfullAlloc;
     size_t[2] numLargePools;
     static TlsCache tcache;
     shared size_t usedTotal;
     shared size_t collectThreshold;
     shared size_t maxHeapSize;
+    shared size_t minHeapSize;
 
     this() {
         sysinfo_ info;
         sysinfo(&info);
         size_t memorySize = (info.totalram + info.totalswap) * info.mem_unit;
         debug(vulture) printf("memorySize = 0x%lx\n", memorySize);
-        metaLock = shared(SpinLock)(SpinLock.Contention.brief);
         memTable = MemoryTable(memorySize);
         maxHeapSize = info.totalram * info.mem_unit / 4; // todo: config
-        collectThreshold = maxHeapSize / 8;  // todo: config
+        minHeapSize = maxHeapSize / 16;
+        collectThreshold = minHeapSize;  // todo: config
         usedTotal = 0;
         import core.stdc.stdio;
         debug(vulture) printf("Vulture GC initialized\n");
@@ -84,7 +85,6 @@ class VultureGC : GC
     }
 
     void lockAll() nothrow {
-        metaLock.lock();
         foreach (size_t i; 0 .. memTable.length) {
             auto pool = memTable[i];
             pool.lock();
@@ -96,7 +96,6 @@ class VultureGC : GC
             auto pool = memTable[i];
             pool.unlock();
         }
-        metaLock.unlock();
     }
 
     /**
@@ -104,9 +103,7 @@ class VultureGC : GC
      */
     void enable() nothrow
     {
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
-        enabled++;
+        atomicFetchAdd(enabled, 1);
     }
 
     /**
@@ -114,33 +111,34 @@ class VultureGC : GC
      */
     void disable()
     {
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
-        enabled--;
+        atomicFetchSub(enabled, 1);
     }
 
     /**
      *
      */
     void collect() nothrow {
-        lockAll();
-        scope(exit) unlockAll();
-        collectAllNoSync(false);
+        collectAll(false);
     }
 
     /**
      *
      */
     void collectNoStack() nothrow {
-        lockAll();
-        scope(exit) unlockAll();
-        collectAllNoSync(true);
+        collectAll(true);
     }
 
-    void collectAllNoSync(bool noStack) nothrow {
+    void collectAll(bool noStack) nothrow {
         debug(vulture) printf("Vulture GC collect started...\n");
         thread_suspendAll();
-
+        Pool*[] pools = cast(Pool*[])mapMemory(memTable.length * (Pool*).sizeof);
+        scope(exit) unmapMemory(pools);
+        size_t toSweep = 0;
+        foreach (size_t i; 0 .. memTable.length){
+            if (memTable[i].type != PoolType.NONE) {
+                pools[toSweep++] = memTable[i];
+            }
+        }
         prepare();
 
         markAll(noStack);
@@ -149,10 +147,16 @@ class VultureGC : GC
         thread_resumeAll();
 
         size_t usedBefore = usedTotal;
-        auto usage = sweep();
+        auto usage = sweep(pools[0..toSweep]);
+        foreach (ref block; lastSuccessfullAlloc[])
+        foreach (ref index; block[]) {
+            atomicStore(index, 0);
+        }
         usedTotal = usage.used; // update after collection
         size_t newThreshold = usage.used * 2 + (usedBefore - usage.used) / 5; // todo: config
-        collectThreshold = newThreshold < maxHeapSize ? newThreshold : maxHeapSize;
+        newThreshold = newThreshold < maxHeapSize ? newThreshold : maxHeapSize;
+        newThreshold = newThreshold < minHeapSize ? minHeapSize : newThreshold;
+        collectThreshold = newThreshold;
         debug(vulture) printf("Vulture GC ended");
     }
 
@@ -329,10 +333,11 @@ class VultureGC : GC
         size_t used;
     }
 
-    MemUsage sweep() nothrow {
+    MemUsage sweep(Pool*[] pools) nothrow {
         size_t free = 0, used = 0;
-        for (size_t i = 0; i < memTable.length; i++) {
-            auto pool = memTable[i];
+        foreach (Pool* pool; pools) {
+            pool.lock();
+            scope(exit) pool.unlock();
             if (pool.type == PoolType.SMALL) {
                 pool.sweepSmall(free, used);
             } else if (pool.type == PoolType.LARGE) {
@@ -354,8 +359,6 @@ class VultureGC : GC
      * minimize free space usage
      */
     void minimize() nothrow {
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
         memTable.minimize();
     }
 
@@ -364,10 +367,8 @@ class VultureGC : GC
      */
     uint getAttr(void* p) nothrow {
         if (!p) return 0;
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
         Pool* pool = memTable.lookup(p);
-        if (!pool) return 0;
+        if (!pool || pool.type == PoolType.NONE) return 0;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.getAttr(p);
@@ -378,10 +379,8 @@ class VultureGC : GC
      */
     uint setAttr(void* p, uint mask) nothrow {
         if (!p) return 0;
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
         Pool* pool = memTable.lookup(p);
-        if (!pool) return 0;
+        if (!pool || pool.type == PoolType.NONE) return 0;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.setAttr(p, mask);
@@ -392,10 +391,8 @@ class VultureGC : GC
      */
     uint clrAttr(void* p, uint mask) nothrow {
         if (!p) return 0;
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
         Pool* pool = memTable.lookup(p);
-        if (!pool) return 0;
+        if (!pool || pool.type == PoolType.NONE) return 0;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.clrAttr(p, mask);
@@ -449,36 +446,33 @@ class VultureGC : GC
             return SmallAlloc.init;
         }
         size_t objectSize = classToSize(sclass);
-        metaLock.lock();
         // todo: circular doubly-linked list of small pools by size class
         size_t i = 0;
         size_t candidates;
         size_t allocatedBytes = 0;
         SmallAlloc alloc;
-        for (i=0; i < memTable.length; i++) {
+        size_t length = memTable.length;
+        for (i = atomicLoad(lastSuccessfullAlloc[noScan][sclass]); i < length; i++) {
             auto pool = memTable[i];
             if (pool.type == PoolType.SMALL && pool.small.objectSize == objectSize) {
-                metaLock.unlock();
                 pool.lock();
                 candidates++;
                 scope(exit) pool.unlock();
                 alloc = allocateRun(pool, allocatedBytes);
                 if (alloc.ptr) {
+                    atomicStore(lastSuccessfullAlloc[noScan][sclass], i);
                     atomicOp!"+="(usedTotal, allocatedBytes);
                     break;
                 }
-                else metaLock.lock();
             }
         }
-        if (i == memTable.length) {
+        if (i == length) {
             if (candidates >= 1 && atomicLoad(usedTotal) > collectThreshold) {
-                metaLock.unlock();
                 collect();
                 return smallAllocSlowPath(sclass, noScan, cache);
             }
             auto pool = memTable.allocate(CHUNKSIZE);
             pool.lock();
-            metaLock.unlock();
             debug(vulture) printf("Initializing small pool\n");
             pool.initializeSmall(sclass, noScan);
             alloc = allocateRun(pool, allocatedBytes);
@@ -491,24 +485,21 @@ class VultureGC : GC
     BlkInfo largeAlloc(size_t size, uint bits) nothrow {
         debug(vulture) printf("Allocating large %ld (%x)\n", size, bits);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
-        metaLock.lock();
-        foreach(i; 0..memTable.length) {
+        size_t length = memTable.length;
+        foreach(i; 0..length) {
             auto p = memTable[i];
             // Quick check of immutable properties w/o locking
             if (p.type == PoolType.LARGE && p.noScan == noScan) {
                 p.lock();
                 scope(exit) p.unlock();
-                metaLock.unlock();
                 auto blk = p.allocateLarge(size, bits);
                 if (blk.base) {
                     atomicOp!"+="(usedTotal, blk.size);
                     return blk;
                 }
-                metaLock.lock();
             }
         }
         if (atomicLoad(usedTotal) > collectThreshold) {
-            metaLock.unlock();
             collect();
             return largeAlloc(size, bits);
         }
@@ -517,7 +508,6 @@ class VultureGC : GC
         size_t poolSize = size < nextSize ? nextSize : roundToChunk(size * 3 / 2);
         auto pool = memTable.allocate(poolSize);
         pool.lock();
-        metaLock.unlock();
         pool.initializeLarge(noScan);
         scope(exit) pool.unlock();
         auto blk = pool.allocateLarge(size, bits);
@@ -531,10 +521,10 @@ class VultureGC : GC
             collect();
             return hugeAlloc(size, bits);
         }
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
         Pool* p = memTable.allocate(size);
+        p.lock();
         p.initializeHuge(size, bits);
+        p.unlock();
         atomicOp!"+="(usedTotal, allocSize);
         return BlkInfo(p.mapped.ptr, size, bits);
     }
@@ -568,11 +558,9 @@ class VultureGC : GC
      *  total size of entire memory block if successful.
      */
     size_t extend(void* p, size_t minsize, size_t maxsize, const TypeInfo ti) nothrow {
-        metaLock.lock();
         Pool* pool = memTable.lookup(p);
         if (!pool) return 0;
         pool.lock();
-        metaLock.unlock();
         scope(exit) pool.unlock();
         BlkInfo newP = pool.tryExtend(p, minsize, maxsize);
         return newP.size;
@@ -594,11 +582,7 @@ class VultureGC : GC
         if (pool.type == PoolType.HUGE)
         {
             memTable.free(pool.mapped);
-            metaLock.lock();
-            pool.lock();
             memTable.deallocate(pool);
-            pool.unlock();
-            metaLock.unlock();
             return;
         }
         else if (pool.type == PoolType.SMALL) {
@@ -614,11 +598,9 @@ class VultureGC : GC
      * allocated pointer, return null.
      */
     void* addrOf(void* p) nothrow {
-        metaLock.lock();
         Pool* pool = memTable.lookup(p);
-        if (!pool) return null;
+        if (!pool || pool.type == PoolType.NONE) return null;
         pool.lock();
-        metaLock.unlock();
         scope(exit) pool.unlock();
         return pool.addrOf(p);
     }
@@ -629,11 +611,9 @@ class VultureGC : GC
      */
     size_t sizeOf(void* p) nothrow
     {
-        metaLock.lock();
         Pool* pool = memTable.lookup(p);
-        if (!pool) return 0;
+        if (!pool || pool.type == PoolType.NONE) return 0;
         pool.lock();
-        metaLock.unlock();
         scope(exit) pool.unlock();
         return pool.sizeOf(p);
     }
@@ -643,11 +623,9 @@ class VultureGC : GC
      * allocated pointer, return null.
      */
     BlkInfo query(void* p) nothrow {
-        metaLock.lock();
         Pool* pool = memTable.lookup(p);
-        if (!pool) return BlkInfo.init;
+        if (!pool || pool.type == PoolType.NONE) return BlkInfo.init;
         pool.lock();
-        metaLock.unlock();
         scope(exit) pool.unlock();
         return pool.query(p);
     }
@@ -740,16 +718,11 @@ class VultureGC : GC
      * run finalizers
      */
     void runFinalizers(scope const(void[]) segment) nothrow {
-        metaLock.lock();
         _inFinalizer = true;
-        scope (exit)
-        {
-            _inFinalizer = false;
-            metaLock.unlock();
-        }
+        scope (exit) _inFinalizer = false;
 
         Pool* p = memTable.lookup(segment.ptr);
-        if(!p) return;
+        if(!p || p.type == PoolType.NONE) return;
         p.runFinalizers(segment);
     }
 
@@ -757,8 +730,6 @@ class VultureGC : GC
      *
      */
     bool inFinalizer() nothrow {
-        metaLock.lock();
-        scope(exit) metaLock.unlock();
         return _inFinalizer;
     }
 }

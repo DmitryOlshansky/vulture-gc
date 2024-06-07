@@ -7,7 +7,7 @@ module vulture.pool_table;
 
 import vulture.pool, vulture.memory;
 
-
+import core.atomic;
 import core.stdc.stdlib;
 debug(vulture) import core.stdc.stdio;
 
@@ -36,15 +36,16 @@ nothrow @nogc:
     Pool* allocate(size_t size) {
         auto _size = roundToChunk(size);
         auto nchunks = _size / CHUNKSIZE;        
-        Pool* pool;
-        if (freelist != null) {
-            pool = freelist;
-            freelist = freelist.next;
-            pool.next = null;
+        Pool* pool = atomicLoad(freelist);
+        while (pool != null) {
+            auto next = freelist.next;
+            if(cas(&freelist, pool, next)) break;
+            pool = atomicLoad(freelist);
         }
-        else {
-            pool = &pools[nextFreePool++];
+        if (pool == null) {
+            pool = &pools[atomicFetchAdd(nextFreePool, 1)];
         }
+        pool.next = null;
         auto start = findMemoryRange(nchunks);
         foreach (i; start .. start + nchunks) {
             poolMap[i] = pool;
@@ -52,6 +53,7 @@ nothrow @nogc:
         debug(vulture) printf("Memory range %ld\n", start);
         auto arena = memory[start*CHUNKSIZE .. (start+nchunks)*CHUNKSIZE];
         debug(vulture) printf("Pool allocated %p..%p\n", arena.ptr, arena.ptr + arena.length);
+        pool.type = PoolType.NONE;
         pool.mapped = arena;
         return pool;
     }
@@ -63,8 +65,9 @@ nothrow @nogc:
             poolMap[i] = null;
         }
         pool.type = PoolType.NONE;
-        pool.next = freelist;
-        freelist = pool;
+        do {
+            pool.next = atomicLoad(freelist);
+        } while(cas(&freelist, pool.next, pool));
     }
 
     void free(void[] mapping) {
@@ -85,8 +88,10 @@ nothrow @nogc:
                 if (poolMap[j] != null) break;
             }
             if (j == i + nchunks) {
-                memoryNextFree = i + nchunks;
-                return i;
+                auto cur = atomicLoad(memoryNextFree);
+                if (cur <= i && cas(&memoryNextFree, cur, j)) {
+                    return i;
+                }
             }
         }
         foreach (i; 0 .. start - nchunks) {
@@ -95,14 +100,16 @@ nothrow @nogc:
                 if (poolMap[j] != null) break;
             }
             if (j == i + nchunks) {
-                memoryNextFree = i + nchunks;
-                return i;
+                auto cur = atomicLoad(memoryNextFree);
+                if (cur <= i && cas(&memoryNextFree, cur, j)) {
+                    return i;
+                }
             }
         }
         assert(0, "Memory fragmentation is too high");
     }
 
-    // Lookup pool for a given pointer, null is not in GC heap
+    // Lookup pool for a given pointer, null is not in GC heap or unallocated
     Pool* lookup(const void *p) {
         if (p >= memory.ptr && p < memoryEnd) {
             auto offset = p - memory.ptr;

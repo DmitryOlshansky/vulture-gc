@@ -2,12 +2,12 @@ module vulture.pool;
 
 static import core.memory;
 import core.bitop;
-import core.internal.spinlock;
+import core.atomic;
 import core.stdc.string;
 debug(vulture) import core.stdc.stdio;
 import core.thread.threadbase;
 
-import vulture.size_class, vulture.memory, vulture.fastdiv;
+import vulture.size_class, vulture.memory, vulture.fastdiv, vulture.spinlock;
 
 package:
 nothrow  @nogc:
@@ -32,30 +32,12 @@ enum PoolType {
 // Buckets for Large pool
 enum BUCKETS = (toPow2(MAXLARGE) - 12 + 3) / 4;
 
-enum NibbleAttr : ubyte {
-    FINALIZE = 0x1,
-    APPENDABLE = 0x2,
-    NO_INTERIOR = 0x4,
-    STRUCTFINAL = 0x8
-}
-
 uint attrFromNibble(ubyte nibble, bool noScan) nothrow pure {
-    uint attr;
-    if (nibble & NibbleAttr.FINALIZE) attr |= BlkAttr.FINALIZE;
-    if (nibble & NibbleAttr.APPENDABLE) attr |= BlkAttr.APPENDABLE;
-    if (nibble & NibbleAttr.NO_INTERIOR) attr |= BlkAttr.NO_INTERIOR;
-    if (nibble & NibbleAttr.STRUCTFINAL) attr |= BlkAttr.STRUCTFINAL;
-    if (noScan) attr |= BlkAttr.NO_SCAN;
-    return attr;
+    return nibble | (noScan ? BlkAttr.NO_SCAN : 0);
 }
 
 ubyte attrToNibble(uint attr) nothrow pure {
-    ubyte nibble;
-    if (attr & BlkAttr.FINALIZE) nibble |= NibbleAttr.FINALIZE;
-    if (attr & BlkAttr.APPENDABLE) nibble |= NibbleAttr.APPENDABLE;
-    if (attr & BlkAttr.NO_INTERIOR) nibble |= NibbleAttr.NO_INTERIOR;
-    if (attr & BlkAttr.STRUCTFINAL) nibble |= BlkAttr.STRUCTFINAL;
-    return nibble;
+    return cast(ubyte)attr;
 }
 
 ubyte toPow2(size_t size) nothrow pure {
@@ -158,7 +140,7 @@ struct Pool {
         LargePool large;
         HugePool huge;
     }
-    shared SpinLock _lock;  // per pool lock
+    shared AlignedSpinLock _lock;  // per pool lock
     PoolType type;          // type of pool (immutable)
     bool noScan;            // if objects of this pool have no pointers (immutable)
     Impl impl;              // concrete pool details
@@ -171,7 +153,7 @@ nothrow @nogc:
     @property ref huge(){ return impl.huge; }
 
     void initializeSmall(ubyte clazz, bool noScan) {
-        _lock = shared(SpinLock)(SpinLock.Contention.medium);
+        _lock = shared(AlignedSpinLock)(SpinLock.Contention.medium);
         this.noScan = noScan;
         this.type = PoolType.SMALL;
         small.objectSize = cast(uint)classToSize(clazz);
