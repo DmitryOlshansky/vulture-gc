@@ -23,7 +23,7 @@ void[] mapMemory(size_t size) {
 }
 
 void freeMemory(void[] slice) {
-    auto ret = madvise(slice.ptr, slice.length, MADV_FREE);
+    auto ret = madvise(slice.ptr, slice.length, MADV_DONTNEED);
     if (ret < 0) {
         perror("unable to free mmap area");
         abort();

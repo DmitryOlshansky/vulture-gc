@@ -67,7 +67,7 @@ nothrow @nogc:
         pool.type = PoolType.NONE;
         do {
             pool.next = atomicLoad(freelist);
-        } while(cas(&freelist, pool.next, pool));
+        } while(!cas(&freelist, pool.next, pool));
     }
 
     void free(void[] mapping) {

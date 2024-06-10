@@ -3,6 +3,7 @@ module vulture.gc;
 import core.atomic;
 import core.stdc.string;
 debug(vulture) import core.stdc.stdio;
+debug(vulture_sweep) import core.stdc.stdio;
 static import core.memory;
 import core.gc.gcinterface;
 import core.gc.registry;
@@ -52,7 +53,7 @@ class VultureGC : GC
     Treap!Root roots;
     Treap!Range ranges;
     MemoryTable memTable;       // table of pool allocations
-    size_t enabled = 1;        
+    long enabled = 1;        
     bool _inFinalizer = false;
     size_t[sizeClasses.length+1][2] lastSuccessfullAlloc;
     size_t[2] numLargePools;
@@ -467,13 +468,13 @@ class VultureGC : GC
             }
         }
         if (i == length) {
-            if (candidates >= 1 && atomicLoad(usedTotal) > collectThreshold) {
+            if (atomicLoad(enabled) > 0 && candidates >= 1 && atomicLoad(usedTotal) > collectThreshold) {
                 collect();
                 return smallAllocSlowPath(sclass, noScan, cache);
             }
             auto pool = memTable.allocate(CHUNKSIZE);
             pool.lock();
-            debug(vulture) printf("Initializing small pool\n");
+            debug(vulture_sweep) printf("Initialized %ld small pool\n", length);
             pool.initializeSmall(sclass, noScan);
             alloc = allocateRun(pool, allocatedBytes);
             atomicOp!"+="(usedTotal, allocatedBytes);
@@ -486,7 +487,8 @@ class VultureGC : GC
         debug(vulture) printf("Allocating large %ld (%x)\n", size, bits);
         bool noScan = (bits & BlkAttr.NO_SCAN) != 0;
         size_t length = memTable.length;
-        foreach(i; 0..length) {
+        auto lastAlloc = &lastSuccessfullAlloc[noScan][sizeClasses.length]; // extra slot for large alloc
+        foreach(i; *lastAlloc..length) {
             auto p = memTable[i];
             // Quick check of immutable properties w/o locking
             if (p.type == PoolType.LARGE && p.noScan == noScan) {
@@ -494,12 +496,13 @@ class VultureGC : GC
                 scope(exit) p.unlock();
                 auto blk = p.allocateLarge(size, bits);
                 if (blk.base) {
+                    *lastAlloc = i;
                     atomicOp!"+="(usedTotal, blk.size);
                     return blk;
                 }
             }
         }
-        if (atomicLoad(usedTotal) > collectThreshold) {
+        if (atomicLoad(enabled) > 0 && atomicLoad(usedTotal) > collectThreshold) {
             collect();
             return largeAlloc(size, bits);
         }
@@ -509,6 +512,7 @@ class VultureGC : GC
         auto pool = memTable.allocate(poolSize);
         pool.lock();
         pool.initializeLarge(noScan);
+        debug(vulture_sweep) printf("Initialized %ld %lx bytes large pool\n", length, poolSize);
         scope(exit) pool.unlock();
         auto blk = pool.allocateLarge(size, bits);
         atomicOp!"+="(usedTotal, blk.size);
@@ -517,7 +521,7 @@ class VultureGC : GC
 
     BlkInfo hugeAlloc(size_t size, uint bits) nothrow {
         size_t allocSize = roundToChunk(size);
-        if (atomicLoad(usedTotal) + allocSize > collectThreshold) {
+        if (atomicLoad(enabled) > 0 && atomicLoad(usedTotal) + allocSize > collectThreshold) {
             collect();
             return hugeAlloc(size, bits);
         }

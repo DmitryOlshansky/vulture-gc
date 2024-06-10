@@ -5,6 +5,7 @@ import core.bitop;
 import core.atomic;
 import core.stdc.string;
 debug(vulture) import core.stdc.stdio;
+debug(vulture_sweep) import core.stdc.stdio;
 import core.thread.threadbase;
 
 import vulture.size_class, vulture.memory, vulture.fastdiv, vulture.spinlock;
@@ -502,6 +503,7 @@ nothrow @nogc:
     }
 
     void sweepLarge(ref size_t freed, ref size_t used) {
+        debug(vulture_sweep) printf("Sweeping %d pages pool\n", large.pages);
         large.buckets[] = uint.max;
         size_t pages = large.pages;
         size_t b = 0;
@@ -515,6 +517,7 @@ nothrow @nogc:
                 }
             } else {
                 if (runStart != size_t.max) {
+                    debug(vulture_sweep) printf("Sweeped run %ld size %ld pages %ld\n", runStart, i - runStart, pages);
                     putToFreeList(cast(uint)runStart, cast(uint)(i - runStart));
                     freedLocal += (i - runStart) * PAGESIZE;
                 }
@@ -526,6 +529,11 @@ nothrow @nogc:
                 mask = 1;
                 b++;
             }
+        }
+        if (runStart != size_t.max) {
+            debug(vulture_sweep) printf("Sweeped run %ld size %ld pages %ld\n", runStart, pages - runStart, pages);
+            putToFreeList(cast(uint)runStart, cast(uint)(pages - runStart));
+            freedLocal += (pages - runStart) * PAGESIZE;
         }
         freed += freedLocal;
         used += usedLocal;
