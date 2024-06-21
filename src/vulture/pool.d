@@ -154,7 +154,6 @@ nothrow @nogc:
 
     void initializeSmall(ubyte clazz, bool noScan) {
         this.noScan = noScan;
-        this.type = PoolType.SMALL;
         small.objectSize = cast(uint)classToSize(clazz);
         small.objects = cast(uint)mapped.length / small.objectSize;
         small.multiplier = multiplier(small.objectSize);
@@ -162,10 +161,10 @@ nothrow @nogc:
         small.attrs = cast(ubyte*)mapMemory(small.objects).ptr;
         small.markBits = cast(size_t*)mapMemory((small.objects + 7) / 8).ptr;
         small.allocBits = cast(size_t*)mapMemory((small.objects + 7) / 8).ptr;
+        atomicStore(this.type, PoolType.SMALL);
     }
 
     void initializeLarge(bool noScan) {
-        type = PoolType.LARGE;
         this.noScan = noScan;
         large.pages = cast(uint)(mapped.length / PAGESIZE);
         large.buckets[] = uint.max;
@@ -177,6 +176,7 @@ nothrow @nogc:
         large.sizeTable[0] = cast(uint)((mapped.length + PAGESIZE-1) / PAGESIZE);
         large.offsetTable[0] = uint.max;
         large.buckets[BUCKETS-1] = 0;
+        atomicStore(type, PoolType.LARGE);
     }
 
     void initializeHuge(size_t size, uint bits) {

@@ -50,6 +50,7 @@ class VultureGC : GC
 {
     auto rootsLock = shared(AlignedSpinLock)(SpinLock.Contention.brief);
     auto rangesLock = shared(AlignedSpinLock)(SpinLock.Contention.brief);
+    auto collectLock = shared(AlignedSpinLock)(SpinLock.Contention.lengthy);
     Treap!Root roots;
     Treap!Range ranges;
     MemoryTable memTable;       // table of pool allocations
@@ -112,7 +113,9 @@ class VultureGC : GC
         collectAll(true);
     }
 
-    void collectAll(bool noStack) nothrow {
+    void collectAll(bool noStack) nothrow {        
+        collectLock.lock();
+        scope(exit) collectLock.unlock();
         debug(vulture) printf("Vulture GC collect started...\n");
         thread_suspendAll();
         Pool*[] pools = cast(Pool*[])mapMemory(memTable.length * (Pool*).sizeof);
@@ -352,7 +355,7 @@ class VultureGC : GC
     uint getAttr(void* p) nothrow {
         if (!p) return 0;
         Pool* pool = memTable.lookup(p);
-        if (!pool || pool.type == PoolType.NONE) return 0;
+        if (!pool || atomicLoad(pool.type) == PoolType.NONE) return 0;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.getAttr(p);
@@ -364,7 +367,7 @@ class VultureGC : GC
     uint setAttr(void* p, uint mask) nothrow {
         if (!p) return 0;
         Pool* pool = memTable.lookup(p);
-        if (!pool || pool.type == PoolType.NONE) return 0;
+        if (!pool || atomicLoad(pool.type) == PoolType.NONE) return 0;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.setAttr(p, mask);
@@ -438,7 +441,7 @@ class VultureGC : GC
         size_t length = memTable.length;
         for (i = atomicLoad(lastSuccessfullAlloc[noScan][sclass]); i < length; i++) {
             auto pool = memTable[i];
-            if (pool.type == PoolType.SMALL && pool.small.objectSize == objectSize) {
+            if (atomicLoad(pool.type) == PoolType.SMALL && pool.small.objectSize == objectSize) {
                 pool.lock();
                 candidates++;
                 scope(exit) pool.unlock();
@@ -566,13 +569,13 @@ class VultureGC : GC
     void free(void* p) nothrow {
         Pool* pool = memTable.lookup(p);
         if (!pool) return;
-        if (pool.type == PoolType.HUGE)
+        if (atomicLoad(pool.type) == PoolType.HUGE)
         {
             memTable.free(pool.mapped);
             memTable.deallocate(pool);
             return;
         }
-        else if (pool.type == PoolType.SMALL) {
+        else if (atomicLoad(pool.type) == PoolType.SMALL) {
             // noop - todo clear allocBit
         }
         pool.lock();
@@ -586,7 +589,7 @@ class VultureGC : GC
      */
     void* addrOf(void* p) nothrow {
         Pool* pool = memTable.lookup(p);
-        if (!pool || pool.type == PoolType.NONE) return null;
+        if (!pool || atomicLoad(pool.type) == PoolType.NONE) return null;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.addrOf(p);
@@ -599,7 +602,7 @@ class VultureGC : GC
     size_t sizeOf(void* p) nothrow
     {
         Pool* pool = memTable.lookup(p);
-        if (!pool || pool.type == PoolType.NONE) return 0;
+        if (!pool || atomicLoad(pool.type) == PoolType.NONE) return 0;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.sizeOf(p);
@@ -611,7 +614,7 @@ class VultureGC : GC
      */
     BlkInfo query(void* p) nothrow {
         Pool* pool = memTable.lookup(p);
-        if (!pool || pool.type == PoolType.NONE) return BlkInfo.init;
+        if (!pool || atomicLoad(pool.type) == PoolType.NONE) return BlkInfo.init;
         pool.lock();
         scope(exit) pool.unlock();
         return pool.query(p);
