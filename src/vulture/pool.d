@@ -14,10 +14,9 @@ package:
 nothrow  @nogc:
 
 enum {
-    CHUNKSIZE = 512 * PAGESIZE,
+    CHUNKSIZE = 2048 << 10,
     MAXSMALL = 2048,
-    MAXLARGE = 8 * CHUNKSIZE, 
-    SMALL_BATCH_SIZE = 32
+    MAXLARGE = 8 * CHUNKSIZE
 }
 
 alias BlkInfo = core.memory.GC.BlkInfo;
@@ -154,7 +153,6 @@ nothrow @nogc:
     @property ref huge(){ return impl.huge; }
 
     void initializeSmall(ubyte clazz, bool noScan) {
-        _lock = shared(AlignedSpinLock)(SpinLock.Contention.medium);
         this.noScan = noScan;
         this.type = PoolType.SMALL;
         small.objectSize = cast(uint)classToSize(clazz);
@@ -176,7 +174,7 @@ nothrow @nogc:
         large.attrs = cast(ubyte*)mapMemory(large.pages).ptr;
         large.markBits = cast(ubyte*)mapMemory(large.pages).ptr;
         // setup free lists as one big chunk of highest bucket
-        large.sizeTable[0] = (cast(uint)(mapped.length) + PAGESIZE-1) / PAGESIZE;
+        large.sizeTable[0] = cast(uint)((mapped.length + PAGESIZE-1) / PAGESIZE);
         large.offsetTable[0] = uint.max;
         large.buckets[BUCKETS-1] = 0;
     }
@@ -552,7 +550,7 @@ nothrow @nogc:
     BlkInfo queryLarge(void* p) {
         uint s = startOfLarge(p);
         void* base = mapped.ptr + s*PAGESIZE;
-        uint size = large.sizeTable[s]*PAGESIZE;
+        size_t size = large.sizeTable[s]*PAGESIZE;
         uint attrs = attrFromNibble(large.attrs[s], noScan);
         return BlkInfo(base, size, attrs);
     }

@@ -28,6 +28,7 @@ shared struct SpinLock
         this.contention = contention;
     }
 
+    pragma(inline, true)
     void lock()
     {
         if (cas(&val, size_t(0), size_t(1)))

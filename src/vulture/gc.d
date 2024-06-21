@@ -64,12 +64,9 @@ class VultureGC : GC
     shared size_t minHeapSize;
 
     this() {
-        sysinfo_ info;
-        sysinfo(&info);
-        size_t memorySize = (info.totalram + info.totalswap) * info.mem_unit;
-        debug(vulture) printf("memorySize = 0x%lx\n", memorySize);
-        memTable = MemoryTable(memorySize);
-        maxHeapSize = info.totalram * info.mem_unit / 4; // todo: config
+        debug(vulture) printf("memorySize = 0x%lx\n", TOTAL_MEMORY);
+        memTable = MemoryTable(TOTAL_MEMORY);
+        maxHeapSize = TOTAL_MEMORY / 4; // todo: config
         minHeapSize = maxHeapSize / 16;
         collectThreshold = minHeapSize;  // todo: config
         usedTotal = 0;
@@ -83,20 +80,6 @@ class VultureGC : GC
     void Dtor()
     {
         memTable.Dtor();
-    }
-
-    void lockAll() nothrow {
-        foreach (size_t i; 0 .. memTable.length) {
-            auto pool = memTable[i];
-            pool.lock();
-        }
-    }
-
-    void unlockAll() nothrow {
-        foreach (size_t i; 0 .. memTable.length) {
-            auto pool = memTable[i];
-            pool.unlock();
-        }
     }
 
     /**
@@ -195,13 +178,13 @@ class VultureGC : GC
 
         Range pop()
         in { assert(!empty); }
-        body {
+        do {
             return _p[--_length];
         }
 
         ref inout(Range) opIndex(size_t idx) inout
         in { assert(idx < _length); }
-        body {
+        do {
             return _p[idx];
         }
 
@@ -239,7 +222,7 @@ class VultureGC : GC
     Lagain:
         // let dmd allocate registers for memory range
         const minAddr = memTable.memory.ptr;
-        const maxAddr = memTable.memory.ptr + memTable.memory.length;
+        const maxAddr = memTable.memoryEnd;
 
         //printf("marking range: [%p..%p] (%#zx)\n", p1, p2, cast(size_t)p2 - cast(size_t)p1);
     Lnext: for (; p1 < p2; p1++)
@@ -250,7 +233,7 @@ class VultureGC : GC
             if (p >= minAddr && p < maxAddr)
             {
                 Pool* pool = memTable.lookup(p);
-                if (pool.type != PoolType.NONE) {
+                if (pool && pool.type != PoolType.NONE) {
                     auto range = pool.mark(p);
                     if(range.ptr != null) {
                         stack[stackPos++] = Range(range.ptr, range.ptr + range.length);
